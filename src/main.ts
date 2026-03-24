@@ -1,20 +1,19 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 
 const SCRIPT_DIR = resolve(import.meta.dirname, "..");
 const WORK_DIR = process.argv[2] ? resolve(process.argv[2]) : process.cwd();
 const SALON_INSTANCE = process.env.SALON_INSTANCE || deriveSalonInstance(WORK_DIR);
-const SALON_DIR = process.env.SALON_DIR || join("/tmp", "salon", SALON_INSTANCE);
+const SALON_DIR = process.env.SALON_DIR || join(process.env.HOME!, ".salon", SALON_INSTANCE);
 const HOST_SESSION_DIR = join(SALON_DIR, "host-sessions");
 const TMUX_SESSION = process.env.SALON_TMUX_SESSION || `salon-${SALON_INSTANCE}`;
 const HOST_PANE = `${TMUX_SESSION}:0.0`;
 const SALON_WORKSPACE_MODE = process.env.SALON_WORKSPACE_MODE || "auto";
 
-type LaunchMode = "fresh" | "resume";
-type ExistingSessionAction = "kill" | "resume" | "attach";
+type ExistingSessionAction = "kill" | "attach";
 
 function deriveSalonInstance(workDir: string): string {
 	const base = basename(workDir) || "workspace";
@@ -66,23 +65,10 @@ function tmuxSendLine(target: string, line: string) {
 	tmux(["send-keys", "-t", target, "Enter"]);
 }
 
-function hasSavedHostSessions(): boolean {
-	if (!existsSync(HOST_SESSION_DIR)) return false;
-	return readdirSync(HOST_SESSION_DIR).some((file) => file.endsWith(".jsonl"));
-}
-
 async function chooseExistingSessionAction(): Promise<ExistingSessionAction> {
-	const answer = (await prompt(`Session '${TMUX_SESSION}' exists. [k]ill / [r]esume / [a]ttach? [a] `)).toLowerCase();
+	const answer = (await prompt(`Session '${TMUX_SESSION}' exists. [k]ill / [a]ttach? [a] `)).toLowerCase();
 	if (answer === "k" || answer === "kill") return "kill";
-	if (answer === "r" || answer === "resume") return "resume";
 	return "attach";
-}
-
-async function chooseLaunchMode(): Promise<LaunchMode> {
-	if (!hasSavedHostSessions()) return "fresh";
-	const answer = (await prompt(`Found previous host sessions in '${HOST_SESSION_DIR}'. Resume? [Y/n] `)).toLowerCase();
-	if (answer === "n" || answer === "no") return "fresh";
-	return "resume";
 }
 
 function configureTmuxSession() {
@@ -99,51 +85,36 @@ function ensureTmuxSession() {
 	configureTmuxSession();
 }
 
-function forwardEnvironmentToHostPane() {
-	const envForward = [
+function setTmuxEnvironment() {
+	const vars: Record<string, string> = {};
+
+	for (const key of [
 		"http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "no_proxy", "NO_PROXY",
 		"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "ALL_PROXY", "all_proxy",
-	]
-		.filter((key) => process.env[key])
-		.map((key) => `export ${key}=${shellQuote(process.env[key]!)}`);
+	]) {
+		if (process.env[key]) vars[key] = process.env[key]!;
+	}
 
-	envForward.push(`export SALON_DIR=${shellQuote(SALON_DIR)}`);
-	envForward.push(`export SALON_INSTANCE=${shellQuote(SALON_INSTANCE)}`);
-	envForward.push(`export SALON_TMUX_SESSION=${shellQuote(TMUX_SESSION)}`);
-	envForward.push(`export SALON_WORK_DIR=${shellQuote(WORK_DIR)}`);
-	envForward.push(`export SALON_WORKSPACE_MODE=${shellQuote(SALON_WORKSPACE_MODE)}`);
-	if (envForward.length > 0) {
-		tmuxSendLine(HOST_PANE, envForward.join("; "));
+	vars.SALON_DIR = SALON_DIR;
+	vars.SALON_INSTANCE = SALON_INSTANCE;
+	vars.SALON_TMUX_SESSION = TMUX_SESSION;
+	vars.SALON_WORK_DIR = WORK_DIR;
+	vars.SALON_WORKSPACE_MODE = SALON_WORKSPACE_MODE;
+	vars.SALON_NODE_BIN = dirname(process.execPath);
+
+	for (const [key, value] of Object.entries(vars)) {
+		tmux(["set-environment", "-t", TMUX_SESSION, key, value]);
 	}
 }
 
-function writeHostLauncherScript(mode: LaunchMode): string {
+function launchHost() {
+	setTmuxEnvironment();
+
 	const extensionPath = join(SCRIPT_DIR, "src", "extension.ts");
-	const launcherPath = join(SALON_DIR, "host-launch.sh");
-	const command = mode === "resume"
-		? joinShellArgs(["pi", "--continue", "--extension", extensionPath])
-		: joinShellArgs(["pi", "--extension", extensionPath]);
-	writeFileSync(launcherPath, [
-		"#!/usr/bin/env bash",
-		"set -euo pipefail",
-		`cd ${shellQuote(WORK_DIR)}`,
-		`exec ${command}`,
-	].join("\n"));
-	chmodSync(launcherPath, 0o755);
-	return launcherPath;
-}
+	const piBin = join(SCRIPT_DIR, "node_modules", ".bin", "pi");
+	const piCommand = joinShellArgs([piBin, "--extension", extensionPath]);
 
-function launchHost(mode: LaunchMode, reuseExistingTmux: boolean) {
-	if (reuseExistingTmux) {
-		// When reusing an existing tmux session, interrupt the old host first to avoid two pi instances sharing the main pane.
-		tmux(["send-keys", "-t", HOST_PANE, "C-c"]);
-		tmux(["send-keys", "-t", HOST_PANE, "C-c"]);
-		tmuxSendLine(HOST_PANE, "clear");
-	}
-
-	forwardEnvironmentToHostPane();
-	const launcherPath = writeHostLauncherScript(mode);
-	tmuxSendLine(HOST_PANE, `exec bash ${shellQuote(launcherPath)}`);
+	tmuxSendLine(HOST_PANE, `eval "$(tmux show-environment -t ${shellQuote(TMUX_SESSION)} -s)" && export PATH="$SALON_NODE_BIN:$PATH" && exec ${piCommand}`);
 }
 
 // Preflight
@@ -204,9 +175,6 @@ const hookPath = join(SCRIPT_DIR, "hooks", "agent-response.sh");
 	}
 })();
 
-let launchMode: LaunchMode;
-let reuseExistingTmux = false;
-
 if (tmuxSessionExists()) {
 	const action = await chooseExistingSessionAction();
 	if (action === "attach") {
@@ -217,23 +185,11 @@ if (tmuxSessionExists()) {
 		}
 		process.exit(0);
 	}
-
-	if (action === "resume") {
-		reuseExistingTmux = true;
-		launchMode = hasSavedHostSessions() ? "resume" : "fresh";
-		if (launchMode === "fresh") {
-			console.log(`No saved host session found in '${HOST_SESSION_DIR}'. Starting fresh host in existing tmux session.`);
-		}
-	} else {
-		tmux(["kill-session", "-t", TMUX_SESSION]);
-		launchMode = await chooseLaunchMode();
-	}
-} else {
-	launchMode = await chooseLaunchMode();
+	tmux(["kill-session", "-t", TMUX_SESSION]);
 }
 
 ensureTmuxSession();
-launchHost(launchMode, reuseExistingTmux);
+launchHost();
 
 // Attach
 try {
