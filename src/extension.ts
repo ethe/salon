@@ -24,7 +24,8 @@ const SALON_STATE_VERSION = 1;
 const SALON_WORKSPACE_MODE = process.env.SALON_WORKSPACE_MODE || "auto";
 
 type GuestType = "claude" | "codex";
-type GuestLifecycleStatus = "active" | "dismissing" | "dismissed";
+type GuestTeardownReason = "host" | "user";
+type GuestLifecycleStatus = "active" | "dismissing" | "suspended" | "dismissed";
 type GuestStatus = "starting" | "working" | "input" | "idle" | "new";
 type WorkspaceIsolationMode = "auto" | "shared";
 
@@ -49,6 +50,7 @@ interface GuestInfo {
 	status: GuestLifecycleStatus;
 	workspaceDir: string;
 	ready: boolean;
+	teardownReason?: GuestTeardownReason;
 }
 
 interface Deferred<T> {
@@ -56,7 +58,7 @@ interface Deferred<T> {
 	resolve: (value: T | PromiseLike<T>) => void;
 }
 
-// Guests that have been dismissed but can be resumed
+// Guests that are not currently active but may still be resumable.
 const dismissedGuests = new Map<string, GuestInfo>();
 
 // ── Discussion state machine ──────────────────────────────────────────
@@ -516,6 +518,7 @@ interface RecoveredSalonSummaryInput {
 	salonInstance: string;
 	workDir: string;
 	activeGuests: Array<Pick<GuestInfo, "name" | "type" | "paneId" | "workspaceDir" | "sessionId" | "ready">>;
+	suspendedGuests: Array<Pick<GuestInfo, "name" | "type" | "workspaceDir" | "sessionId">>;
 	dismissedGuests: Array<Pick<GuestInfo, "name" | "type" | "workspaceDir" | "sessionId">>;
 	activeDiscussions: Array<{
 		topic: string;
@@ -608,6 +611,7 @@ function buildGuestExitWrapperScript(options: {
 function formatRecoveredSalonSummary(input: RecoveredSalonSummaryInput): string | undefined {
 	if (
 		input.activeGuests.length === 0 &&
+		input.suspendedGuests.length === 0 &&
 		input.dismissedGuests.length === 0 &&
 		input.activeDiscussions.length === 0 &&
 		input.archivedPendingDiscussions.length === 0
@@ -629,8 +633,15 @@ function formatRecoveredSalonSummary(input: RecoveredSalonSummaryInput): string 
 		}
 	}
 
+	if (input.suspendedGuests.length > 0) {
+		lines.push(`Suspended guests (auto-paused when host exited, ready to resume):`);
+		for (const guest of input.suspendedGuests) {
+			lines.push(`- ${guest.name} (${guest.type}) workspace=${guest.workspaceDir} session=${guest.sessionId || "none"}`);
+		}
+	}
+
 	if (input.dismissedGuests.length > 0) {
-		lines.push(`Dismissed guests that can be resumed:`);
+		lines.push(`Dismissed guests:`);
 		for (const guest of input.dismissedGuests) {
 			lines.push(`- ${guest.name} (${guest.type}) workspace=${guest.workspaceDir} session=${guest.sessionId || "none"}`);
 		}
@@ -1155,7 +1166,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 				ready: false,
 			};
 
-			if (persistedGuest.status === "dismissed") {
+			if (persistedGuest.status === "dismissed" || persistedGuest.status === "suspended") {
 				dismissedGuests.set(baseGuest.name, baseGuest);
 				continue;
 			}
@@ -1167,7 +1178,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 				continue;
 			}
 
-			baseGuest.status = "dismissed";
+			baseGuest.status = "suspended";
 			dismissedGuests.set(baseGuest.name, baseGuest);
 		}
 
@@ -1195,6 +1206,31 @@ export default function salonExtension(pi: ExtensionAPI) {
 		return detectGuestStatus(guest.paneId);
 	}
 
+	function resolveInactiveGuestStatus(guest: GuestInfo): "suspended" | "dismissed" {
+		if (guest.status === "suspended" || guest.status === "dismissed") return guest.status;
+		return guest.teardownReason === "host" ? "suspended" : "dismissed";
+	}
+
+	function buildInactiveGuestRecord(guest: GuestInfo): GuestInfo {
+		return {
+			...guest,
+			status: resolveInactiveGuestStatus(guest),
+			ready: false,
+			submitKey: submitKeyForGuestType(guest.type),
+			teardownReason: undefined,
+		};
+	}
+
+	function captureFinalCodexSessionId(guest: GuestInfo) {
+		if (guest.type === "codex" && !guest.sessionId) {
+			const candidate = findCodexSessionCandidate(guest, normalizePath(guest.workspaceDir));
+			if (candidate) {
+				claimGuestSessionId(guest, candidate.sessionId);
+			}
+		}
+		cancelCodexSessionScan(guest.name);
+	}
+
 	function removeGuestFromDiscussion(name: string) {
 		const discId = guestToDiscussion.get(name);
 		if (!discId) return;
@@ -1217,10 +1253,14 @@ export default function salonExtension(pi: ExtensionAPI) {
 		}
 	}
 
-	function beginGuestDismissal(guest: GuestInfo): Promise<void> {
+	function beginGuestDismissal(guest: GuestInfo, teardownReason: GuestTeardownReason): Promise<void> {
 		const waitForExit = ensureGuestExitWaiter(guest);
-		if (guest.status === "dismissing") return waitForExit;
-		cancelCodexSessionScan(guest.name);
+		if (guest.status === "dismissing") {
+			guest.teardownReason = guest.teardownReason || teardownReason;
+			return waitForExit;
+		}
+		guest.teardownReason = teardownReason;
+		captureFinalCodexSessionId(guest);
 		guest.status = "dismissing";
 		removeGuestFromDiscussion(guest.name);
 		writeGuestRuntimeFile(guest);
@@ -1355,7 +1395,8 @@ export default function salonExtension(pi: ExtensionAPI) {
 			salonInstance: SALON_INSTANCE,
 			workDir,
 			activeGuests: Array.from(guests.values()),
-			dismissedGuests: Array.from(dismissedGuests.values()),
+			suspendedGuests: Array.from(dismissedGuests.values()).filter((guest) => guest.status === "suspended"),
+			dismissedGuests: Array.from(dismissedGuests.values()).filter((guest) => guest.status === "dismissed"),
 			activeDiscussions: Array.from(discussions.values()).map((discussion) => ({
 				topic: discussion.topic,
 				stage: discussion.stage,
@@ -1374,6 +1415,83 @@ export default function salonExtension(pi: ExtensionAPI) {
 					guestB: discussion.guestB,
 				})),
 		});
+	}
+
+	function resumeInactiveGuest(name: string): GuestInfo {
+		name = sanitizeGuestName(name);
+		const dismissed = dismissedGuests.get(name);
+		if (!dismissed) {
+			const available = Array.from(dismissedGuests.keys());
+			throw new Error(`Guest '${name}' not found in suspended/dismissed list. Available: ${available.length ? available.join(", ") : "none"}`);
+		}
+		if (!dismissed.sessionId) {
+			throw new Error(`Guest '${name}' has no saved session ID. Must invite as new guest.`);
+		}
+		if (guests.has(name)) {
+			throw new Error(`Guest '${name}' is already active in the salon.`);
+		}
+
+		cancelCodexSessionScan(name);
+		const guestWorkDir = dismissed.workspaceDir || ensureGuestWorkspace(name, dismissed.type, workDir, salonDir);
+		const paneId = spawnPane(guestWorkDir);
+		if (!paneId) throw new Error("Failed to create tmux pane");
+
+		const guest: GuestInfo = {
+			name: dismissed.name,
+			type: dismissed.type,
+			paneId,
+			submitKey: submitKeyForGuestType(dismissed.type),
+			sessionId: dismissed.sessionId,
+			nonce: dismissed.nonce,
+			startedAt: Date.now(),
+			status: "active",
+			workspaceDir: guestWorkDir,
+			ready: false,
+		};
+		guests.set(name, guest);
+		dismissedGuests.delete(name);
+		if (guest.sessionId) claimedSessionIds.add(guest.sessionId);
+		queuedGuestMessages.delete(name);
+		writeGuestRuntimeFile(guest);
+
+		const instructionsFile = join(guestDir, `${name}.instructions`);
+		// Instructions file should still exist from the original invite
+		if (!existsSync(instructionsFile)) {
+			writeFileSync(instructionsFile, buildGuestInstructions(guest.nonce));
+		}
+
+		let cmd: string;
+		if (dismissed.type === "codex") {
+			cmd = joinShellArgs(["codex", "resume", dismissed.sessionId!, "-c", `model_instructions_file=${instructionsFile}`]);
+		} else {
+			const exchangeDir = join(salonDir, "exchange");
+			mkdirSync(exchangeDir, { recursive: true });
+			cmd = joinShellArgs([
+				"claude",
+				"--resume",
+				dismissed.sessionId!,
+				"--append-system-prompt-file",
+				instructionsFile,
+				"--add-dir",
+				exchangeDir,
+			]);
+		}
+
+		// Wrapper script: run agent, capture session ID after exit, notify host
+		const wrapperScript = join(guestDir, `${name}.wrapper.sh`);
+		writeFileSync(wrapperScript, buildGuestExitWrapperScript({
+			name,
+			salonDir,
+			workDir: guestWorkDir,
+			command: cmd,
+			initialSessionId: dismissed.sessionId,
+		}));
+		chmodSync(wrapperScript, 0o755);
+
+		sendKeys(paneId, `exec bash ${shellQuote(wrapperScript)}`);
+		reactivateArchivedDiscussions();
+		persistSalonState();
+		return guest;
 	}
 
 	function cleanupDiscussion(discId: string, disc: Discussion) {
@@ -1682,7 +1800,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 			if (guest.status === "dismissing") {
 				return { content: [{ type: "text" as const, text: `Guest '${params.name}' is already being dismissed.` }], details: {} };
 			}
-			beginGuestDismissal(guest);
+			beginGuestDismissal(guest, "user");
 			return { content: [{ type: "text" as const, text: `Guest '${params.name}' is leaving the salon.` }], details: {} };
 		},
 	});
@@ -1690,88 +1808,57 @@ export default function salonExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "resume_guest",
 		label: "Resume Guest",
-		description: "Resume a previously dismissed guest with their full conversation history intact.",
-		promptSnippet: "Resume a dismissed guest with their previous session",
+		description: "Resume a previously suspended or dismissed guest with their full conversation history intact.",
+		promptSnippet: "Resume a suspended or dismissed guest with their previous session",
 		parameters: Type.Object({
-			name: Type.String({ description: "Name of the dismissed guest to resume" }),
+			name: Type.String({ description: "Name of the suspended or dismissed guest to resume" }),
 		}),
 		async execute(_id, params: any) {
 			params.name = sanitizeGuestName(params.name);
-			const dismissed = dismissedGuests.get(params.name);
-			if (!dismissed) {
-				const available = Array.from(dismissedGuests.keys());
-				throw new Error(`Guest '${params.name}' not found in dismissed list. Available: ${available.length ? available.join(", ") : "none"}`);
-			}
-			if (!dismissed.sessionId) {
-				throw new Error(`Guest '${params.name}' has no saved session ID. Must invite as new guest.`);
-			}
-			if (guests.has(params.name)) {
-				throw new Error(`Guest '${params.name}' is already active in the salon.`);
-			}
-
-			cancelCodexSessionScan(params.name);
-			const guestWorkDir = dismissed.workspaceDir || ensureGuestWorkspace(params.name, dismissed.type, workDir, salonDir);
-			const paneId = spawnPane(guestWorkDir);
-			if (!paneId) throw new Error("Failed to create tmux pane");
-
-			const guest: GuestInfo = {
-				name: dismissed.name,
-				type: dismissed.type,
-				paneId,
-				submitKey: submitKeyForGuestType(dismissed.type),
-				sessionId: dismissed.sessionId,
-				nonce: dismissed.nonce,
-				startedAt: Date.now(),
-				status: "active",
-				workspaceDir: guestWorkDir,
-				ready: false,
-			};
-			guests.set(params.name, guest);
-			dismissedGuests.delete(params.name);
-			if (guest.sessionId) claimedSessionIds.add(guest.sessionId);
-			queuedGuestMessages.delete(params.name);
-			writeGuestRuntimeFile(guest);
-
-			const instructionsFile = join(guestDir, `${params.name}.instructions`);
-			// Instructions file should still exist from the original invite
-			if (!existsSync(instructionsFile)) {
-				writeFileSync(instructionsFile, buildGuestInstructions(guest.nonce));
-			}
-
-			let cmd: string;
-			if (dismissed.type === "codex") {
-				cmd = joinShellArgs(["codex", "resume", dismissed.sessionId!, "-c", `model_instructions_file=${instructionsFile}`]);
-			} else {
-				const exchangeDir = join(salonDir, "exchange");
-				mkdirSync(exchangeDir, { recursive: true });
-				cmd = joinShellArgs([
-					"claude",
-					"--resume",
-					dismissed.sessionId!,
-					"--append-system-prompt-file",
-					instructionsFile,
-					"--add-dir",
-					exchangeDir,
-				]);
-			}
-
-			// Wrapper script: run agent, capture session ID after exit, notify host
-			const wrapperScript = join(guestDir, `${params.name}.wrapper.sh`);
-			writeFileSync(wrapperScript, buildGuestExitWrapperScript({
-				name: params.name,
-				salonDir,
-				workDir: guestWorkDir,
-				command: cmd,
-				initialSessionId: dismissed.sessionId,
-			}));
-			chmodSync(wrapperScript, 0o755);
-
-			sendKeys(paneId, `exec bash ${shellQuote(wrapperScript)}`);
-			reactivateArchivedDiscussions();
-			persistSalonState();
+			const inactive = dismissedGuests.get(params.name);
+			const guest = resumeInactiveGuest(params.name);
 
 			return {
-				content: [{ type: "text" as const, text: `Resumed guest '${params.name}' (${dismissed.type}) with previous session. Full conversation history intact.` }],
+				content: [{ type: "text" as const, text: `Resumed guest '${params.name}' (${inactive?.type || guest.type}) with previous session. Full conversation history intact.` }],
+				details: {},
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "resume_all",
+		label: "Resume All Suspended Guests",
+		description: "Resume all suspended guests whose sessions were auto-paused when the host exited.",
+		promptSnippet: "Resume all suspended guests",
+		parameters: Type.Object({}),
+		async execute() {
+			const suspendedGuests = Array.from(dismissedGuests.values()).filter((guest) => guest.status === "suspended");
+			if (suspendedGuests.length === 0) {
+				return { content: [{ type: "text" as const, text: "No suspended guests are waiting to be resumed." }], details: {} };
+			}
+
+			const resumed: string[] = [];
+			const failed: string[] = [];
+			for (const guest of suspendedGuests) {
+				try {
+					resumeInactiveGuest(guest.name);
+					resumed.push(guest.name);
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					failed.push(`${guest.name}: ${message}`);
+				}
+			}
+
+			const parts: string[] = [];
+			if (resumed.length > 0) {
+				parts.push(`Resumed suspended guests: ${resumed.join(", ")}.`);
+			}
+			if (failed.length > 0) {
+				parts.push(`Failed to resume: ${failed.join(" | ")}`);
+			}
+
+			return {
+				content: [{ type: "text" as const, text: parts.join(" ") || "No suspended guests were resumed." }],
 				details: {},
 			};
 		},
@@ -1955,18 +2042,18 @@ When these appear, process them thoughtfully — don't just echo them to the use
 						claimedSessionIds.add(guest.sessionId);
 					}
 					const droppedQueuedCount = queuedGuestMessages.get(name)?.length || 0;
-					guest.status = "dismissed";
-					guest.ready = false;
+					const inactiveGuest = buildInactiveGuestRecord(guest);
 					guests.delete(name);
-					dismissedGuests.set(name, { ...guest, status: "dismissed", submitKey: submitKeyForGuestType(guest.type) });
+					dismissedGuests.set(name, inactiveGuest);
 					queuedGuestMessages.delete(name);
 					removeGuestFromDiscussion(name);
-					writeGuestRuntimeFile(guest);
+					writeGuestRuntimeFile(inactiveGuest);
 					persistSalonState();
 					settleGuestExitWaiter(name);
-					const resumeHint = guest.sessionId ? ` Session saved — use resume_guest to bring them back.` : "";
+					const resumeHint = inactiveGuest.sessionId ? ` Session saved — use resume_guest to bring them back.` : "";
 					const queueHint = droppedQueuedCount > 0 ? ` ${droppedQueuedCount} queued message(s) were never delivered.` : "";
-					pi.sendUserMessage(`[salon] Guest '${name}' has left the salon.${resumeHint}${queueHint}`, { deliverAs: "followUp" });
+					const exitLabel = inactiveGuest.status === "suspended" ? "has been suspended" : "has left the salon";
+					pi.sendUserMessage(`[salon] Guest '${name}' ${exitLabel}.${resumeHint}${queueHint}`, { deliverAs: "followUp" });
 				}
 				return;
 			}
@@ -1982,8 +2069,9 @@ When these appear, process them thoughtfully — don't just echo them to the use
 		const exitWaits: Promise<void>[] = [];
 		for (const guest of guests.values()) {
 			if (guest.status === "active") {
-				exitWaits.push(beginGuestDismissal(guest));
+				exitWaits.push(beginGuestDismissal(guest, "host"));
 			} else if (guest.status === "dismissing") {
+				guest.teardownReason = guest.teardownReason || "host";
 				exitWaits.push(ensureGuestExitWaiter(guest));
 			}
 		}
@@ -1998,9 +2086,9 @@ When these appear, process them thoughtfully — don't just echo them to the use
 			settleGuestExitWaiter(name);
 			if (!guest.sessionId) continue;
 			guests.delete(name);
-			const dismissedGuest = { ...guest, status: "dismissed" as const, ready: false };
-			dismissedGuests.set(name, dismissedGuest);
-			writeGuestRuntimeFile(dismissedGuest);
+			const inactiveGuest = buildInactiveGuestRecord(guest);
+			dismissedGuests.set(name, inactiveGuest);
+			writeGuestRuntimeFile(inactiveGuest);
 		}
 		persistSalonState();
 

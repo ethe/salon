@@ -266,7 +266,8 @@ console.log("\n== 12. Resume summary formatting ==");
 		salonInstance: "test-instance",
 		workDir: "/repo",
 		activeGuests: [{ name: "alice", type: "claude", paneId: "%1", workspaceDir: "/repo", sessionId: "s1", ready: true }],
-		dismissedGuests: [{ name: "bob", type: "codex", workspaceDir: "/repo/worktrees/bob", sessionId: "s2" }],
+		suspendedGuests: [{ name: "bob", type: "codex", workspaceDir: "/repo/worktrees/bob", sessionId: "s2" }],
+		dismissedGuests: [{ name: "carol", type: "claude", workspaceDir: "/repo/worktrees/carol", sessionId: "s3" }],
 		activeDiscussions: [{
 			topic: "direction-check",
 			stage: "debating",
@@ -279,6 +280,8 @@ console.log("\n== 12. Resume summary formatting ==");
 	});
 	assert("Summary includes instance", summary?.includes("test-instance") === true);
 	assert("Summary includes active guest", summary?.includes("alice (claude)") === true);
+	assert("Summary includes suspended section", summary?.includes("Suspended guests (auto-paused when host exited, ready to resume):") === true);
+	assert("Summary includes dismissed section", summary?.includes("Dismissed guests:") === true);
 	assert("Summary includes discussion stage", summary?.includes("stage=debating") === true);
 }
 
