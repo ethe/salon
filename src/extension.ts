@@ -276,15 +276,20 @@ function startMessageServer(
 
 	const server = createServer((conn) => {
 		let data = "";
-		conn.on("data", (chunk) => { data += chunk.toString(); });
-		conn.on("end", () => {
+		let handled = false;
+		function tryHandle() {
+			if (handled) return;
 			try {
 				const msg = JSON.parse(data);
 				if (msg.from && msg.content) {
+					handled = true;
 					onMessage(msg);
 				}
-			} catch { /* ignore malformed */ }
-		});
+			} catch { /* incomplete JSON, wait for more data */ }
+			if (handled) conn.destroy();
+		}
+		conn.on("data", (chunk) => { data += chunk.toString(); tryHandle(); });
+		conn.on("end", tryHandle);
 	});
 
 	server.listen(socketPath);
@@ -550,9 +555,12 @@ function buildGuestExitWrapperScript(options: {
 	initialSessionId?: string;
 }): string {
 	const sockPath = join(options.salonDir, "salon.sock");
+	const tmuxSession = process.env.SALON_TMUX_SESSION || "";
 	return [
 		`#!/usr/bin/env bash`,
 		`set -uo pipefail -m`,
+		...(tmuxSession ? [`eval "$(tmux show-environment -t ${shellQuote(tmuxSession)} -s)"`] : []),
+		`export PATH="$SALON_NODE_BIN:$PATH"`,
 		`export SALON_DIR=${shellQuote(options.salonDir)} SALON_GUEST_NAME=${shellQuote(options.name)}`,
 		`SOCK=${shellQuote(sockPath)}`,
 		`send_system_event() {`,
@@ -563,7 +571,15 @@ function buildGuestExitWrapperScript(options: {
 		`  for _ in $(seq 1 150); do`,
 		`    CURRENT_COMMAND=$(tmux display-message -p -t "$TMUX_PANE" "#{pane_current_command}" 2>/dev/null || true)`,
 		`    if [ -n "$CURRENT_COMMAND" ] && [ "$CURRENT_COMMAND" != "bash" ] && [ "$CURRENT_COMMAND" != "zsh" ] && [ "$CURRENT_COMMAND" != "sh" ]; then`,
-		`      sleep 0.5`,
+		`      for _ in $(seq 1 60); do`,
+		`        PANE_CONTENT=$(tmux capture-pane -t "$TMUX_PANE" -p 2>/dev/null || true)`,
+		`        if printf '%s' "$PANE_CONTENT" | grep -qE '❯|› '; then`,
+		`          sleep 0.3`,
+		`          send_system_event "guest_ready:${options.name}"`,
+		`          exit 0`,
+		`        fi`,
+		`        sleep 0.5`,
+		`      done`,
 		`      send_system_event "guest_ready:${options.name}"`,
 		`      exit 0`,
 		`    fi`,
