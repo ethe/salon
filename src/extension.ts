@@ -50,6 +50,11 @@ interface GuestInfo {
 	ready: boolean;
 }
 
+interface Deferred<T> {
+	promise: Promise<T>;
+	resolve: (value: T | PromiseLike<T>) => void;
+}
+
 // Guests that have been dismissed but can be resumed
 const dismissedGuests = new Map<string, GuestInfo>();
 
@@ -109,6 +114,7 @@ const guestToDiscussion = new Map<string, string>();
 const claimedSessionIds = new Set<string>();
 const activeCodexSessionScans = new Map<string, ReturnType<typeof setTimeout>>();
 const queuedGuestMessages = new Map<string, Array<{ message: string; from: string }>>();
+const guestExitWaiters = new Map<string, Deferred<void>>();
 
 const CODEX_SESSION_SCAN_INITIAL_DELAY_MS = 2000;
 const CODEX_SESSION_SCAN_INTERVAL_MS = 2000;
@@ -117,6 +123,14 @@ const CODEX_SESSION_SCAN_MAX_FIRST_LINE_BYTES = 16 * 1024;
 
 function shellQuote(value: string): string {
 	return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function createDeferred<T>(): Deferred<T> {
+	let resolve!: (value: T | PromiseLike<T>) => void;
+	const promise = new Promise<T>((resolvePromise) => {
+		resolve = resolvePromise;
+	});
+	return { promise, resolve };
 }
 
 function joinShellArgs(args: string[]): string {
@@ -785,6 +799,21 @@ export default function salonExtension(pi: ExtensionAPI) {
 		persistSalonState();
 	}
 
+	function ensureGuestExitWaiter(guest: GuestInfo): Promise<void> {
+		const existing = guestExitWaiters.get(guest.name);
+		if (existing) return existing.promise;
+		const deferred = createDeferred<void>();
+		guestExitWaiters.set(guest.name, deferred);
+		return deferred.promise;
+	}
+
+	function settleGuestExitWaiter(name: string) {
+		const waiter = guestExitWaiters.get(name);
+		if (!waiter) return;
+		guestExitWaiters.delete(name);
+		waiter.resolve(undefined);
+	}
+
 	function findCodexSessionCandidate(guest: GuestInfo, normalizedWorkDir: string): CodexSessionScanCandidate | undefined {
 		let bestCandidate: CodexSessionScanCandidate | undefined;
 
@@ -944,6 +973,9 @@ export default function salonExtension(pi: ExtensionAPI) {
 		for (const timer of activeCodexSessionScans.values()) {
 			clearTimeout(timer);
 		}
+		for (const waiter of guestExitWaiters.values()) {
+			waiter.resolve(undefined);
+		}
 		guests.clear();
 		dismissedGuests.clear();
 		discussions.clear();
@@ -952,6 +984,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 		claimedSessionIds.clear();
 		activeCodexSessionScans.clear();
 		queuedGuestMessages.clear();
+		guestExitWaiters.clear();
 	}
 
 	function restoreMsgFileCounter() {
@@ -1067,8 +1100,9 @@ export default function salonExtension(pi: ExtensionAPI) {
 		}
 	}
 
-	function beginGuestDismissal(guest: GuestInfo) {
-		if (guest.status === "dismissing") return;
+	function beginGuestDismissal(guest: GuestInfo): Promise<void> {
+		const waitForExit = ensureGuestExitWaiter(guest);
+		if (guest.status === "dismissing") return waitForExit;
 		cancelCodexSessionScan(guest.name);
 		guest.status = "dismissing";
 		removeGuestFromDiscussion(guest.name);
@@ -1079,6 +1113,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 		tmux(["send-keys", "-t", guest.paneId, "C-c"]);
 		tmux(["send-keys", "-t", guest.paneId, "-l", "exit"]);
 		tmux(["send-keys", "-t", guest.paneId, "Enter"]);
+		return waitForExit;
 	}
 
 	function flushQueuedGuestMessages(guest: GuestInfo) {
@@ -1764,80 +1799,86 @@ When these appear, process them thoughtfully — don't just echo them to the use
 	function openSalonMessageServer() {
 		messageServer?.close();
 		messageServer = startMessageServer(socketPath, (msg) => {
-				// Handle guest lifecycle events
-				if (msg.from === "_system" && msg.content.startsWith("guest_ready:")) {
-					const name = msg.content.slice("guest_ready:".length);
-					const guest = guests.get(name);
-					if (guest && !guest.ready) {
-						guest.ready = true;
-						writeGuestRuntimeFile(guest);
-						flushQueuedGuestMessages(guest);
+			// Handle guest lifecycle events
+			if (msg.from === "_system" && msg.content.startsWith("guest_ready:")) {
+				const name = msg.content.slice("guest_ready:".length);
+				const guest = guests.get(name);
+				if (guest && !guest.ready) {
+					guest.ready = true;
+					writeGuestRuntimeFile(guest);
+					flushQueuedGuestMessages(guest);
+				}
+				return;
+			}
+
+			if (msg.from === "_system" && msg.content.startsWith("guest_ready_timeout:")) {
+				const name = msg.content.slice("guest_ready_timeout:".length);
+				const queuedCount = queuedGuestMessages.get(name)?.length || 0;
+				const queuedHint = queuedCount > 0 ? ` ${queuedCount} queued message(s) are still pending.` : "";
+				pi.sendUserMessage(
+					`[salon] Guest '${name}' did not report ready within 30 seconds.${queuedHint}`,
+					{ deliverAs: "followUp" },
+				);
+				return;
+			}
+
+			if (msg.from === "_system" && msg.content.startsWith("guest_exited:")) {
+				// Format: guest_exited:<name>:<sessionId>
+				const parts = msg.content.slice("guest_exited:".length).split(":");
+				const name = parts[0];
+				const sessionId = parts[1] || undefined;
+				const guest = guests.get(name) || dismissedGuests.get(name);
+				if (guest) {
+					cancelCodexSessionScan(name);
+					if (!guest.sessionId && sessionId) {
+						guest.sessionId = sessionId;
 					}
-					return;
-				}
-
-				if (msg.from === "_system" && msg.content.startsWith("guest_ready_timeout:")) {
-					const name = msg.content.slice("guest_ready_timeout:".length);
-					const queuedCount = queuedGuestMessages.get(name)?.length || 0;
-					const queuedHint = queuedCount > 0 ? ` ${queuedCount} queued message(s) are still pending.` : "";
-					pi.sendUserMessage(
-						`[salon] Guest '${name}' did not report ready within 30 seconds.${queuedHint}`,
-						{ deliverAs: "followUp" },
-					);
-					return;
-				}
-
-				if (msg.from === "_system" && msg.content.startsWith("guest_exited:")) {
-					// Format: guest_exited:<name>:<sessionId>
-					const parts = msg.content.slice("guest_exited:".length).split(":");
-					const name = parts[0];
-					const sessionId = parts[1] || undefined;
-					const guest = guests.get(name) || dismissedGuests.get(name);
-					if (guest) {
-						cancelCodexSessionScan(name);
-						if (!guest.sessionId && sessionId) {
-							guest.sessionId = sessionId;
-						}
-						if (guest.sessionId) {
-							claimedSessionIds.add(guest.sessionId);
-						}
-						const droppedQueuedCount = queuedGuestMessages.get(name)?.length || 0;
-						guest.status = "dismissed";
-						guest.ready = false;
-						guests.delete(name);
-						dismissedGuests.set(name, { ...guest, status: "dismissed", submitKey: submitKeyForGuestType(guest.type) });
-						queuedGuestMessages.delete(name);
-						removeGuestFromDiscussion(name);
-						writeGuestRuntimeFile(guest);
-						persistSalonState();
-						const resumeHint = guest.sessionId ? ` Session saved — use resume_guest to bring them back.` : "";
-						const queueHint = droppedQueuedCount > 0 ? ` ${droppedQueuedCount} queued message(s) were never delivered.` : "";
-						pi.sendUserMessage(`[salon] Guest '${name}' has left the salon.${resumeHint}${queueHint}`, { deliverAs: "followUp" });
+					if (guest.sessionId) {
+						claimedSessionIds.add(guest.sessionId);
 					}
-					return;
+					const droppedQueuedCount = queuedGuestMessages.get(name)?.length || 0;
+					guest.status = "dismissed";
+					guest.ready = false;
+					guests.delete(name);
+					dismissedGuests.set(name, { ...guest, status: "dismissed", submitKey: submitKeyForGuestType(guest.type) });
+					queuedGuestMessages.delete(name);
+					removeGuestFromDiscussion(name);
+					writeGuestRuntimeFile(guest);
+					persistSalonState();
+					settleGuestExitWaiter(name);
+					const resumeHint = guest.sessionId ? ` Session saved — use resume_guest to bring them back.` : "";
+					const queueHint = droppedQueuedCount > 0 ? ` ${droppedQueuedCount} queued message(s) were never delivered.` : "";
+					pi.sendUserMessage(`[salon] Guest '${name}' has left the salon.${resumeHint}${queueHint}`, { deliverAs: "followUp" });
 				}
+				return;
+			}
 
-				const handled = handleDiscussionMessage(msg.from, msg.content);
-				if (!handled) {
-					pi.sendUserMessage(`[${msg.from}]: ${msg.content}`, { deliverAs: "followUp" });
-				}
-			});
-		}
+			const handled = handleDiscussionMessage(msg.from, msg.content);
+			if (!handled) {
+				pi.sendUserMessage(`[${msg.from}]: ${msg.content}`, { deliverAs: "followUp" });
+			}
+		});
+	}
 
 	async function teardownSalonSession(options: { killTmuxSession: boolean }) {
+		const exitWaits: Promise<void>[] = [];
 		for (const guest of guests.values()) {
-			if (guest.status === "active") beginGuestDismissal(guest);
+			if (guest.status === "active") {
+				exitWaits.push(beginGuestDismissal(guest));
+			} else if (guest.status === "dismissing") {
+				exitWaits.push(ensureGuestExitWaiter(guest));
+			}
 		}
 
-		const waitUntil = Date.now() + 5000;
-		while (Date.now() < waitUntil) {
-			const stillDismissing = Array.from(guests.values()).some((guest) => guest.status === "dismissing");
-			if (!stillDismissing) break;
-			await new Promise((r) => setTimeout(r, 100));
-		}
+		await Promise.race([
+			Promise.all(exitWaits),
+			new Promise<void>((resolve) => setTimeout(resolve, 5000)),
+		]);
 
 		for (const [name, guest] of Array.from(guests.entries())) {
-			if (guest.status !== "dismissing" || !guest.sessionId) continue;
+			if (guest.status !== "dismissing") continue;
+			settleGuestExitWaiter(name);
+			if (!guest.sessionId) continue;
 			guests.delete(name);
 			const dismissedGuest = { ...guest, status: "dismissed" as const, ready: false };
 			dismissedGuests.set(name, dismissedGuest);
