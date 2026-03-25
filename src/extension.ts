@@ -1598,6 +1598,12 @@ The discuss tool automates the full flow. Your responsibilities at each stage:
 
 You judge when the debate has converged enough to synthesize. Don't rush — if guests are still raising substantive new points, continue the debate.
 
+## Guest lifecycle
+Guests persist after their task or discussion completes — finalize_discussion does NOT dismiss them. Prefer reusing an existing guest who already has context over inviting a new one. Only invite a new guest when you need a fresh perspective or the existing guest's context is irrelevant.
+
+## Review workflow
+When working with reviewers, follow this sequence strictly: implement → review → fix → confirm → commit. Never skip the confirmation step — after fixing reviewer feedback, always let the reviewer verify the fix before proceeding.
+
 ## Waiting for guests
 Guest responses are delivered to you automatically — you do NOT need to poll, check, or call list_guests in a loop. After sending a task via say_to_guest or starting a discuss, simply finish your current response. When a guest replies, it will appear as your next input message (e.g. [guest-name]: ...). Do nothing until then.
 
