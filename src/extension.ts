@@ -165,6 +165,16 @@ function tmux(args: string[]): string {
 	}
 }
 
+function equalizeGuestPanes() {
+	const panes = tmux(["list-panes", "-t", `${TMUX_SESSION}:0`, "-F", "#{pane_id}"]).split("\n").filter(Boolean);
+	if (panes.length <= 1) return;
+	const totalWidth = tmux(["display-message", "-t", `${TMUX_SESSION}:0`, "-p", "#{window_width}"]);
+	const halfWidth = Math.floor(Number(totalWidth) / 2);
+	tmux(["set-option", "-t", `${TMUX_SESSION}:0`, "main-pane-width", String(halfWidth)]);
+	tmux(["select-layout", "-t", `${TMUX_SESSION}:0`, "main-vertical"]);
+	tmux(["select-pane", "-t", `${TMUX_SESSION}:0.0`]);
+}
+
 function spawnPane(workDir: string): string {
 	const paneCount = tmux(["list-panes", "-t", `${TMUX_SESSION}:0`, "-F", "#{pane_id}"]).split("\n").filter(Boolean).length;
 	let newPaneId: string;
@@ -173,15 +183,8 @@ function spawnPane(workDir: string): string {
 	} else {
 		const lastPane = tmux(["list-panes", "-t", `${TMUX_SESSION}:0`, "-F", "#{pane_id}"]).split("\n").filter(Boolean).pop()!;
 		newPaneId = tmux(["split-window", "-v", "-t", lastPane, "-c", workDir, "-P", "-F", "#{pane_id}"]);
-		// Re-balance: main-vertical distributes guests evenly in right column
-		// Then set main pane (host) to 50% width to keep 1:1 ratio
-		const totalWidth = tmux(["display-message", "-t", `${TMUX_SESSION}:0`, "-p", "#{window_width}"]);
-		const halfWidth = Math.floor(Number(totalWidth) / 2);
-		tmux(["set-option", "-t", `${TMUX_SESSION}:0`, "main-pane-width", String(halfWidth)]);
-		tmux(["select-layout", "-t", `${TMUX_SESSION}:0`, "main-vertical"]);
 	}
-	// Keep focus on host pane
-	tmux(["select-pane", "-t", `${TMUX_SESSION}:0.0`]);
+	equalizeGuestPanes();
 	return newPaneId;
 }
 
@@ -1897,6 +1900,7 @@ When these appear, process them thoughtfully — don't just echo them to the use
 					writeGuestRuntimeFile(inactiveGuest);
 					persistSalonState();
 					settleGuestExitWaiter(name);
+					equalizeGuestPanes();
 					const resumeHint = inactiveGuest.sessionId ? ` Session saved — use resume_guest to bring them back.` : "";
 					const queueHint = droppedQueuedCount > 0 ? ` ${droppedQueuedCount} queued message(s) were never delivered.` : "";
 					const exitLabel = inactiveGuest.status === "suspended" ? "has been suspended" : "has left the salon";
