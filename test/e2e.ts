@@ -266,8 +266,8 @@ console.log("\n== 12. Resume summary formatting ==");
 		salonInstance: "test-instance",
 		workDir: "/repo",
 		activeGuests: [{ name: "alice", type: "claude", paneId: "%1", workspaceDir: "/repo", sessionId: "s1", ready: true }],
-		suspendedGuests: [{ name: "bob", type: "codex", workspaceDir: "/repo/worktrees/bob", sessionId: "s2" }],
-		dismissedGuests: [{ name: "carol", type: "claude", workspaceDir: "/repo/worktrees/carol", sessionId: "s3" }],
+		suspendedGuests: [{ name: "bob", type: "codex", workspaceDir: "/repo", sessionId: "s2" }],
+		dismissedGuests: [{ name: "carol", type: "claude", workspaceDir: "/repo", sessionId: "s3" }],
 		activeDiscussions: [{
 			topic: "direction-check",
 			stage: "debating",
@@ -285,31 +285,6 @@ console.log("\n== 12. Resume summary formatting ==");
 	assert("Summary includes discussion stage", summary?.includes("stage=debating") === true);
 }
 
-console.log("\n== 13. Codex guests get isolated git worktrees ==");
-{
-	const repoDir = "/tmp/salon-worktree-repo";
-	rmSync(repoDir, { recursive: true, force: true });
-	mkdirSync(repoDir, { recursive: true });
-	execSync(`git init "${repoDir}"`, { stdio: "pipe" });
-	execSync(`git -C "${repoDir}" config user.email salon@example.com`, { stdio: "pipe" });
-	execSync(`git -C "${repoDir}" config user.name Salon`, { stdio: "pipe" });
-	writeFileSync(join(repoDir, "tracked.txt"), "base\n");
-	execSync(`git -C "${repoDir}" add tracked.txt && git -C "${repoDir}" commit -m init`, { stdio: "pipe" });
-	writeFileSync(join(repoDir, "tracked.txt"), "dirty\n");
-	writeFileSync(join(repoDir, "untracked.txt"), "extra\n");
-
-	const isolatedDir = extensionTest.ensureGuestWorkspace("worker", "codex", repoDir, SALON_DIR);
-	assert("Worktree path differs from primary repo", isolatedDir !== repoDir);
-	assert("Tracked dirty changes copied into worktree", readFileSync(join(isolatedDir, "tracked.txt"), "utf-8") === "dirty\n");
-	assert("Untracked files copied into worktree", readFileSync(join(isolatedDir, "untracked.txt"), "utf-8") === "extra\n");
-
-	writeFileSync(join(repoDir, "tracked.txt"), "dirty-again\n");
-	const isolatedDirAgain = extensionTest.ensureGuestWorkspace("worker", "codex", repoDir, SALON_DIR);
-	assert("Existing worktree path reused", isolatedDirAgain === isolatedDir);
-	assert("Existing worktree re-syncs tracked changes", readFileSync(join(isolatedDirAgain, "tracked.txt"), "utf-8") === "dirty-again\n");
-
-	rmSync(repoDir, { recursive: true, force: true });
-}
 
 // ══════════════════════════════════════════════════════════════════════
 cleanup();

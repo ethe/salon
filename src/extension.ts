@@ -12,7 +12,7 @@ import { Container, type SelectItem, SelectList, Text } from "@mariozechner/pi-t
 import { Type } from "@sinclair/typebox";
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { chmodSync, closeSync, cpSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { createServer, type Server } from "node:net";
@@ -21,13 +21,10 @@ const SALON_INSTANCE = process.env.SALON_INSTANCE || "default";
 const TMUX_SESSION = process.env.SALON_TMUX_SESSION || `salon-${SALON_INSTANCE}`;
 const SALON_STATE_ENTRY_TYPE = "salon_state";
 const SALON_STATE_VERSION = 1;
-const SALON_WORKSPACE_MODE = process.env.SALON_WORKSPACE_MODE || "auto";
-
 type GuestType = "claude" | "codex";
 type GuestTeardownReason = "host" | "user";
 type GuestLifecycleStatus = "active" | "dismissing" | "suspended" | "dismissed";
 type GuestStatus = "starting" | "working" | "input" | "idle" | "new";
-type WorkspaceIsolationMode = "auto" | "shared";
 
 interface GuestRuntimeFile {
 	name: string;
@@ -328,76 +325,6 @@ function git(args: string[], cwd: string): string | undefined {
 	}
 }
 
-function shouldIsolateGuestWorkspace(type: GuestType): boolean {
-	const mode = SALON_WORKSPACE_MODE === "shared" ? "shared" : "auto";
-	return mode !== "shared" && type === "codex";
-}
-
-function syncWorktreeWithPrimaryWorkspace(repoRoot: string, worktreeRoot: string) {
-	const diff = git(["diff", "--binary", "HEAD", "--"], repoRoot);
-	if (diff && diff.trim()) {
-		execFileSync("git", ["apply", "--allow-empty", "--whitespace=nowarn"], {
-			cwd: worktreeRoot,
-			input: diff,
-			stdio: ["pipe", "pipe", "pipe"],
-		});
-	}
-
-	const untracked = git(["ls-files", "--others", "--exclude-standard", "-z"], repoRoot);
-	if (!untracked) return;
-	for (const relativePath of untracked.split("\0").filter(Boolean)) {
-		const sourcePath = join(repoRoot, relativePath);
-		const targetPath = join(worktreeRoot, relativePath);
-		mkdirSync(dirname(targetPath), { recursive: true });
-		cpSync(sourcePath, targetPath, { recursive: true });
-	}
-}
-
-function removeGuestWorktree(worktreeRoot: string) {
-	try {
-		const commonDir = git(["rev-parse", "--git-common-dir"], worktreeRoot)?.trim();
-		if (commonDir) {
-			const commonDirPath = resolve(worktreeRoot, commonDir);
-			const repoRoot = dirname(commonDirPath);
-			execFileSync("git", ["-C", repoRoot, "worktree", "remove", "--force", worktreeRoot], {
-				stdio: ["pipe", "pipe", "pipe"],
-			});
-			execFileSync("git", ["-C", repoRoot, "worktree", "prune"], {
-				stdio: ["pipe", "pipe", "pipe"],
-			});
-			return;
-		}
-	} catch {
-		// Fall through to best-effort filesystem cleanup.
-	}
-
-	rmSync(worktreeRoot, { recursive: true, force: true });
-}
-
-function ensureGuestWorkspace(name: string, type: GuestType, workDir: string, salonDir: string): string {
-	if (!shouldIsolateGuestWorkspace(type)) return workDir;
-
-	const repoRoot = git(["rev-parse", "--show-toplevel"], workDir)?.trim();
-	if (!repoRoot) return workDir;
-
-	const worktreeRoot = join(salonDir, "worktrees", sanitizeGuestName(name));
-	const relativeWorkDir = relative(repoRoot, normalizePath(workDir));
-
-	try {
-		if (existsSync(worktreeRoot)) {
-			removeGuestWorktree(worktreeRoot);
-		}
-		mkdirSync(join(salonDir, "worktrees"), { recursive: true });
-		const head = git(["rev-parse", "HEAD"], repoRoot)?.trim();
-		if (!head) return workDir;
-		execFileSync("git", ["worktree", "add", "--detach", worktreeRoot, head], { cwd: repoRoot, stdio: ["pipe", "pipe", "pipe"] });
-		syncWorktreeWithPrimaryWorkspace(repoRoot, worktreeRoot);
-	} catch {
-		return workDir;
-	}
-
-	return relativeWorkDir && relativeWorkDir !== "" ? join(worktreeRoot, relativeWorkDir) : worktreeRoot;
-}
 
 function serializeStartedAt(startedAt: number): string {
 	return new Date(startedAt).toISOString();
@@ -681,8 +608,7 @@ function inviteGuest(
 
 	cancelCodexSessionScan(name);
 
-	const guestWorkDir = ensureGuestWorkspace(name, type, workDir, salonDir);
-	const paneId = spawnPane(guestWorkDir);
+	const paneId = spawnPane(workDir);
 	if (!paneId) throw new Error("Failed to create tmux pane");
 
 	const submitKey = submitKeyForGuestType(type);
@@ -697,7 +623,7 @@ function inviteGuest(
 		nonce,
 		startedAt: Date.now(),
 		status: "active",
-		workspaceDir: guestWorkDir,
+		workspaceDir: workDir,
 		ready: false,
 	};
 	guests.set(name, guest);
@@ -742,7 +668,7 @@ function inviteGuest(
 	writeFileSync(wrapperScript, buildGuestExitWrapperScript({
 		name,
 		salonDir,
-		workDir: guestWorkDir,
+		workDir,
 		command: cmd,
 		initialSessionId: guest.sessionId,
 	}));
@@ -975,35 +901,6 @@ export default function salonExtension(pi: ExtensionAPI) {
 
 	function persistSalonState() {
 		pi.appendEntry<SalonStateSnapshot>(SALON_STATE_ENTRY_TYPE, buildSalonStateSnapshot());
-	}
-
-	function getTrackedGuestWorktreeRoots(): Set<string> {
-		const trackedRoots = new Set<string>();
-		const worktreesDir = join(salonDir, "worktrees");
-		const collect = (guest: GuestInfo) => {
-			const relativePath = relative(worktreesDir, guest.workspaceDir);
-			if (!relativePath || relativePath.startsWith("..")) return;
-			const rootName = relativePath.split("/")[0];
-			if (!rootName) return;
-			trackedRoots.add(join(worktreesDir, rootName));
-		};
-
-		for (const guest of guests.values()) collect(guest);
-		for (const guest of dismissedGuests.values()) collect(guest);
-		return trackedRoots;
-	}
-
-	function cleanupOrphanedGuestWorktrees() {
-		const worktreesDir = join(salonDir, "worktrees");
-		if (!existsSync(worktreesDir)) return;
-
-		const trackedRoots = getTrackedGuestWorktreeRoots();
-		for (const entry of readdirSync(worktreesDir)) {
-			const worktreeRoot = join(worktreesDir, entry);
-			if (!trackedRoots.has(worktreeRoot)) {
-				removeGuestWorktree(worktreeRoot);
-			}
-		}
 	}
 
 	function clearRuntimeState() {
@@ -1432,8 +1329,8 @@ export default function salonExtension(pi: ExtensionAPI) {
 		}
 
 		cancelCodexSessionScan(name);
-		const guestWorkDir = dismissed.workspaceDir || ensureGuestWorkspace(name, dismissed.type, workDir, salonDir);
-		const paneId = spawnPane(guestWorkDir);
+		const resumeWorkDir = dismissed.workspaceDir || workDir;
+		const paneId = spawnPane(resumeWorkDir);
 		if (!paneId) throw new Error("Failed to create tmux pane");
 
 		const guest: GuestInfo = {
@@ -1445,7 +1342,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 			nonce: dismissed.nonce,
 			startedAt: Date.now(),
 			status: "active",
-			workspaceDir: guestWorkDir,
+			workspaceDir: resumeWorkDir,
 			ready: false,
 		};
 		guests.set(name, guest);
@@ -1482,7 +1379,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 		writeFileSync(wrapperScript, buildGuestExitWrapperScript({
 			name,
 			salonDir,
-			workDir: guestWorkDir,
+			workDir: resumeWorkDir,
 			command: cmd,
 			initialSessionId: dismissed.sessionId,
 		}));
@@ -1995,7 +1892,6 @@ When these appear, process them thoughtfully — don't just echo them to the use
 			}
 		}
 		scheduleMissingCodexSessionScans();
-		cleanupOrphanedGuestWorktrees();
 		if (restoredSnapshot) {
 			pendingResumeSummary = buildRecoveredSalonSummary();
 		}
@@ -2228,7 +2124,6 @@ When these appear, process them thoughtfully — don't just echo them to the use
 
 export const __test__ = {
 	buildGuestExitWrapperScript,
-	ensureGuestWorkspace,
 	formatRecoveredSalonSummary,
 	sanitizeGuestName,
 };
