@@ -1796,6 +1796,34 @@ When these appear, process them thoughtfully — don't just echo them to the use
 		return { systemPrompt: hostPreamble + resumeSummary + basePrompt };
 	});
 
+	// ── Inject guest status snapshot into user messages ──────────────
+	pi.on("input", (event) => {
+		if (event.source !== "interactive") return { action: "continue" as const };
+
+		const lines: string[] = [];
+		for (const g of guests.values()) {
+			const status = getGuestDisplayStatus(g);
+			const discId = guestToDiscussion.get(g.name);
+			const disc = discId ? discussions.get(discId) : undefined;
+			const discLabel = disc ? ` [discussing: ${disc.stage}]` : "";
+			lines.push(`  ${g.name} (${g.type}): ${status}${discLabel}`);
+		}
+		for (const g of dismissedGuests.values()) {
+			if (g.status !== "suspended") continue;
+			lines.push(`  ${g.name} (${g.type}): ${g.status}${g.sessionId ? " (session saved)" : ""}`);
+		}
+
+		if (lines.length === 0) return { action: "continue" as const };
+
+		const snapshot = `[salon-status]\n${lines.join("\n")}\n[/salon-status]`;
+		const text = event.text ? snapshot + "\n\n" + event.text : snapshot;
+		return {
+			action: "transform" as const,
+			text,
+			images: event.images,
+		};
+	});
+
 	// ── Receive guest responses via Unix socket ──────────────────────
 	const socketPath = join(salonDir, "salon.sock");
 	let messageServer: Server | undefined;
