@@ -51,7 +51,7 @@ export class TmuxBackend implements GuestRuntime {
 
 	send(runtimeId: string, text: string): void {
 		const submitKey = this.submitKeys.get(runtimeId);
-		if (!submitKey) throw new Error(`No submit key registered for runtime '${runtimeId}'. Was adopt() or spawn() called?`);
+		if (!submitKey) throw new Error(`No submit key registered for runtime '${runtimeId}'. Was spawn() called?`);
 		this.sendRaw(runtimeId, text, submitKey);
 	}
 
@@ -122,15 +122,11 @@ export class TmuxBackend implements GuestRuntime {
 		this.tmux(["kill-session", "-t", this.tmuxSession]);
 	}
 
-	listAlive(): string[] {
+	// ── Internal helpers ─────────────────────────────────────────────
+
+	private listAlive(): string[] {
 		return this.tmux(["list-panes", "-t", `${this.tmuxSession}:0`, "-F", "#{pane_id}"]).split("\n").filter(Boolean);
 	}
-
-	adopt(runtimeId: string, guestType: "claude" | "codex"): void {
-		this.submitKeys.set(runtimeId, submitKeyForGuestType(guestType));
-	}
-
-	// ── Internal helpers ─────────────────────────────────────────────
 
 	private tmux(args: string[]): string {
 		try {

@@ -45,12 +45,6 @@ export interface GuestRuntime {
 
 	/** Destroy the entire runtime session (e.g. kill tmux session). */
 	destroySession(): void;
-
-	/** List all live runtime IDs. */
-	listAlive(): string[];
-
-	/** Adopt an existing runtime (e.g. after session restore). Backend configures transport based on guestType. */
-	adopt(runtimeId: string, guestType: "claude" | "codex"): void;
 }
 
 // ── Session-level bootstrap ──────────────────────────────────────────

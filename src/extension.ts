@@ -735,8 +735,6 @@ export default function salonExtension(pi: ExtensionAPI) {
 	function restoreSalonState(snapshot: SalonStateSnapshot) {
 		clearRuntimeState();
 
-		const livePanes = new Set(runtime.listAlive());
-
 		for (const persistedGuest of Object.values(snapshot.guests || {})) {
 			const runtimeGuest = readGuestRuntimeFile(persistedGuest.name);
 			const record: GuestRecord = {
@@ -748,27 +746,11 @@ export default function salonExtension(pi: ExtensionAPI) {
 					parseStartedAt(runtimeGuest?.startedAt) ||
 					parseStartedAt(persistedGuest.startedAt) ||
 					Date.now(),
-				lifecycleStatus: persistedGuest.status,
+				// All guests become suspended on restore; resume via resume_guest / autoResume.
+				lifecycleStatus: persistedGuest.status === "dismissed" ? "dismissed" : "suspended",
 				workspaceDir: runtimeGuest?.workspaceDir || persistedGuest.workspaceDir || workDir,
 			};
 
-			if (persistedGuest.status === "dismissed" || persistedGuest.status === "suspended") {
-				dismissedGuests.set(record.name, record);
-				continue;
-			}
-
-			if (runtimeGuest && livePanes.has(runtimeGuest.paneId)) {
-				const guest: Guest = {
-					...record,
-					runtimeId: runtimeGuest.paneId,
-					ready: true,
-				};
-				runtime.adopt(runtimeGuest.paneId, record.type);
-				guests.set(guest.name, guest);
-				continue;
-			}
-
-			record.lifecycleStatus = "suspended";
 			dismissedGuests.set(record.name, record);
 		}
 
