@@ -11,9 +11,18 @@ Two concrete use cases:
 1. **Structured discussion** — Two agents independently explore a design question, cross-review each other's proposals across multiple rounds until they reach consensus (or surface open questions for the user), and the host synthesizes the result.
 2. **Delegated execution** — The host assigns a clear task to a single guest agent while the user continues working. The guest's result is automatically reported back.
 
+### How salon differs from Agent Teams
+
+Claude Code's [Agent Teams](https://code.claude.com/docs/en/agent-teams) is a built-in multi-agent feature where a lead Claude Code session spawns teammate Claude Code sessions that coordinate via a shared task list. Salon takes a different approach:
+
+- **Cross-model collaboration**: Salon coordinates Claude Code *and* Codex CLI in the same session. Different models have genuinely different strengths — Claude tends toward analytical depth, Codex toward engineering rigor. Discussions between them surface perspectives that a single-model team cannot.
+- **Structured debate protocol**: Agent Teams use free-form messaging and a shared task list. Salon's `discuss` tool enforces a specific flow — independent exploration → adversarial cross-review → host synthesis → guest confirmation — designed to extract disagreement rather than converge prematurely.
+- **Host as facilitator, not lead worker**: In Agent Teams, the lead is also a Claude Code instance that assigns tasks and does work. In salon, the host is a distinct role that does not read code or make changes — it frames questions, facilitates discussion, and synthesizes results. This separation prevents the coordinator from anchoring the team's output.
+- **Model-agnostic architecture**: Salon communicates with guests through tmux panes and Unix sockets, not Claude Code internals. Salon uses terminal automation and socket IPC rather than product-specific SDK internals, so it can be extended to other TUI agents with additional runtime and hook integration.
+
 ## How it works
 
-Salon is a [pi](https://github.com/badlogic/pi-mono) extension. The host runs as a pi instance with salon tools; guests are standard Claude Code or Codex CLI processes in tmux panes. For detailed internal architecture, see [ARCHITECTURE.md](ARCHITECTURE.md).
+Salon is a [pi](https://github.com/badlogic/pi-mono) extension. The host runs as a pi instance with salon tools; guests are standard Claude Code or Codex CLI processes running in tmux panes within the same session.
 
 ```
 ┌──────────────────────┬──────────────────────┐
@@ -26,74 +35,25 @@ Salon is a [pi](https://github.com/badlogic/pi-mono) extension. The host runs as
       tmux session "salon-<instance>"
 ```
 
-### Communication
+The host communicates with guests by sending messages into their TUI and receiving responses via a Unix socket. Messages are queued until a guest is ready, and long messages are exchanged through files. Guests respond automatically — the host never needs to poll. You can also switch to any guest's pane and interact with them directly.
 
-```
-Host → Guest:  tmux send-keys (simulates typing into guest's TUI)
-Guest → Host:  Stop hook / notify → Unix domain socket (in-memory IPC)
-```
+### Structured discussion
 
-- **Host to guest**: Messages are prefixed with `[host]:` so guests know the source. Long messages (>2000 chars) are written to `SALON_DIR/exchange/` and guests receive a file reference instead.
-- **Guest to host**: Claude Code's Stop hook and Codex CLI's notify mechanism both call `hooks/agent-response.sh`, which extracts the response and sends it to the host's Unix socket server.
-- **Human to guest**: The user can switch to any guest's tmux pane and type directly. Messages without a `[name]:` prefix are treated as private — they are not forwarded to the host.
+The `discuss` tool orchestrates a multi-round debate between two guests:
 
-### Discussion state machine
-
-The `discuss` tool automates a multi-round debate:
-
-```
-Round 1 (exploring)
-  Both guests receive the same question, explore independently.
-      ↓ both respond
-Round 2+ (debating)
-  Each guest receives the other's response, gives feedback.
-      ↓ both respond → host reviews
-  ├─ advance_discussion("continue")   → another debate round
-  ├─ advance_discussion("synthesize") → host writes synthesis
-  └─ advance_discussion("ask_user")   → pause and escalate open questions
-
-Synthesis
-  Host submits synthesis to both guests for review.
-      ↓ both respond
-  ├─ finalize_discussion             → done
-  └─ revise and submit_synthesis     → another synthesis review round
-```
+1. **Explore** — Both guests receive the same question and respond independently.
+2. **Debate** — Each guest reviews the other's proposal. After each round, the host decides: continue debating, move to synthesis, or escalate to the user.
+3. **Synthesize** — The host writes a synthesis and submits it to both guests for confirmation.
 
 Cross-review messages use the other guest's name as prefix (`[alice]:`, `[bob]:`), so each guest knows who they're responding to.
 
 ### Guest lifecycle
 
-- **Spawn**: `exec` replaces the shell process — when the agent exits, the tmux pane closes automatically.
-- **Ready signal**: guests queue incoming messages until their wrapper reports `guest_ready` over the salon socket, so startup no longer depends on a fixed sleep.
-- **Status detection**: `tmux capture-pane` inspects the TUI status bar to determine if a guest is working, waiting for input (approval), or idle. (Inspired by [gavraz/recon](https://github.com/gavraz/recon).)
-- **Exit tracking**: the guest wrapper reports `guest_exited:<name>:<sessionId>` over the salon socket when the agent process terminates. The host automatically deregisters the guest and keeps its session/workspace metadata for resume.
+Guests go through: **spawn** → **ready** → **active** (working/idle) → **dismiss** or **suspend**. Suspended guests retain their session IDs and can be resumed with full conversation history. When the host session restarts, suspended guests are automatically resumed.
 
-### Session continuity
+The host is a facilitator, not a developer — it does not read code or make changes directly. It frames questions, chooses which guests to involve, facilitates discussion, and synthesizes results.
 
-- **Host resume**: salon stores structured runtime state via `pi.appendEntry()` in a salon-specific host session directory and restores it on `pi --continue`.
-- **Guest resume**: dismissed guests keep their session IDs and workspace paths. `resume_guest` relaunches the original Claude/Codex session when possible.
-- **Recovered state injection**: after resume, the host receives a structured summary of recovered guests and discussions in its system prompt so it does not lose the salon's discussion state.
-- **Session switching**: `/new` and `/resume` now dismiss active guests, persist the current salon state, and restore the target salon session after the switch.
-
-### Guest system prompt injection
-
-Guests receive salon context at the system prompt level, not as a chat message:
-
-- **Claude Code**: `--append-system-prompt-file` + `--add-dir` for exchange directory access
-- **Codex CLI**: `-c model_instructions_file="..."` + `C-m` as submit key (Codex treats `Enter` as newline)
-
-The injected instructions are minimal — only the communication protocol (what `[name]:` prefixes mean), no personality changes.
-
-### Host behavior
-
-The host's system prompt defines it as a facilitator, not a developer:
-
-- Does not read code or write implementations directly — delegates to guests
-- Forwards user questions to guests as-is, without rewriting or decomposing
-- For multi-guest discussions, always uses the `discuss` tool (never manual orchestration)
-- Receives guest responses asynchronously via `followUp` delivery, no polling
-- Synthesizes by identifying agreements, analyzing disagreements, and giving a recommendation with reasoning
-- On resume, receives a structured summary of recovered guests/discussions before the next turn
+For implementation details — IPC mechanisms, TUI status detection, state persistence, Codex session association, error handling — see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Usage
 
