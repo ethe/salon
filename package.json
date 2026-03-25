@@ -5,16 +5,18 @@
   "type": "module",
   "scripts": {
     "start": "tsx src/main.ts",
+    "setup": "tsx src/setup.ts",
+    "postinstall": "tsx src/setup.ts",
     "test": "tsx test/e2e.ts",
     "build": "tsc"
   },
   "dependencies": {
-    "@mariozechner/pi-coding-agent": "^0.61.1",
+    "@mariozechner/pi-coding-agent": "^0.62.0",
     "@sinclair/typebox": "^0.34.0"
   },
   "devDependencies": {
+    "@types/node": "^22.10.5",
     "tsx": "^4.20.3",
-    "typescript": "^5.9.2",
-    "@types/node": "^22.10.5"
+    "typescript": "^5.9.2"
   }
 }
