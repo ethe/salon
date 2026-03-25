@@ -1301,6 +1301,19 @@ export default function salonExtension(pi: ExtensionAPI) {
 		return guest;
 	}
 
+	function autoResumeAllSuspendedGuests() {
+		const suspended = Array.from(dismissedGuests.values()).filter(
+			(g) => g.status === "suspended" && g.sessionId,
+		);
+		for (const guest of suspended) {
+			try {
+				resumeInactiveGuest(guest.name);
+			} catch {
+				// Leave as suspended if resume fails (e.g. tmux pane creation error)
+			}
+		}
+	}
+
 	function cleanupDiscussion(discId: string, disc: Discussion) {
 		guestToDiscussion.delete(disc.guestA);
 		guestToDiscussion.delete(disc.guestB);
@@ -1802,6 +1815,7 @@ When these appear, process them thoughtfully — don't just echo them to the use
 		}
 		scheduleMissingCodexSessionScans();
 		if (restoredSnapshot) {
+			autoResumeAllSuspendedGuests();
 			pendingResumeSummary = buildRecoveredSalonSummary();
 		}
 	}
