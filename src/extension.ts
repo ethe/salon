@@ -15,7 +15,7 @@ import { execFileSync } from "node:child_process";
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, realpathSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
-import { createServer, type Server } from "node:net";
+import { createConnection, createServer, type Server } from "node:net";
 import type { GuestRuntime, GuestStatus } from "./runtime.js";
 import { TmuxBackend } from "./tmux-backend.js";
 import {
@@ -106,6 +106,7 @@ const CODEX_SESSION_SCAN_INITIAL_DELAY_MS = 2000;
 const CODEX_SESSION_SCAN_INTERVAL_MS = 2000;
 const CODEX_SESSION_SCAN_TIMEOUT_MS = 30000;
 const CODEX_SESSION_SCAN_MAX_FIRST_LINE_BYTES = 16 * 1024;
+const SOCKET_PROBE_TIMEOUT_MS = 250;
 
 function shellQuote(value: string): string {
 	return `'${value.replace(/'/g, `'\\''`)}'`;
@@ -185,12 +186,79 @@ function cancelCodexSessionScan(name: string) {
 }
 
 // ── Unix socket server for receiving guest messages ───────────────────
-function startMessageServer(
+function readHostPidForSocket(socketPath: string): number | undefined {
+	const hostPidPath = join(dirname(socketPath), "host.pid");
+	if (!existsSync(hostPidPath)) return undefined;
+	try {
+		const pid = Number(readFileSync(hostPidPath, "utf-8").trim());
+		return Number.isInteger(pid) && pid > 0 ? pid : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function isProcessAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
+
+function probeSocket(socketPath: string): Promise<"listening" | "stale" | "missing"> {
+	return new Promise((resolve, reject) => {
+		const conn = createConnection(socketPath);
+		let settled = false;
+		const timer = setTimeout(() => finish("stale"), SOCKET_PROBE_TIMEOUT_MS);
+
+		function finish(result: "listening" | "stale" | "missing") {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			conn.destroy();
+			resolve(result);
+		}
+
+		conn.once("connect", () => finish("listening"));
+		conn.once("error", (error: NodeJS.ErrnoException) => {
+			if (error.code === "ENOENT") {
+				finish("missing");
+				return;
+			}
+			if (error.code === "ECONNREFUSED" || error.code === "ENOTSOCK") {
+				finish("stale");
+				return;
+			}
+			clearTimeout(timer);
+			conn.destroy();
+			reject(error);
+		});
+	});
+}
+
+async function ensureSocketPathAvailable(socketPath: string) {
+	if (!existsSync(socketPath)) return;
+
+	const ownerPid = readHostPidForSocket(socketPath);
+	if (ownerPid && ownerPid !== process.pid && isProcessAlive(ownerPid)) {
+		throw new Error(`Salon socket '${socketPath}' is already owned by active host process ${ownerPid}.`);
+	}
+
+	const socketState = await probeSocket(socketPath);
+	if (socketState === "listening") {
+		const ownerLabel = ownerPid ? ` (host pid ${ownerPid})` : "";
+		throw new Error(`Salon socket '${socketPath}' is already accepting connections${ownerLabel}.`);
+	}
+
+	unlinkSync(socketPath);
+}
+
+async function startMessageServer(
 	socketPath: string,
 	onMessage: (msg: { from: string; content: string }) => void,
-): Server {
-	// Clean up stale socket
-	if (existsSync(socketPath)) unlinkSync(socketPath);
+): Promise<Server> {
+	await ensureSocketPathAvailable(socketPath);
 
 	const server = createServer((conn) => {
 		let data = "";
@@ -210,8 +278,13 @@ function startMessageServer(
 		conn.on("end", tryHandle);
 	});
 
-	server.listen(socketPath);
-	return server;
+	return await new Promise<Server>((resolve, reject) => {
+		server.once("error", reject);
+		server.listen(socketPath, () => {
+			server.removeListener("error", reject);
+			resolve(server);
+		});
+	});
 }
 
 const GUEST_INSTRUCTIONS =
@@ -519,10 +592,10 @@ export default function salonExtension(pi: ExtensionAPI) {
 	const guestDir = join(salonDir, "guests");
 	const runtime: GuestRuntime = new TmuxBackend(TMUX_SESSION);
 	const hostSessionDir = join(salonDir, "host-sessions");
+	const hostPidPath = join(salonDir, "host.pid");
 	const workDir = process.env.SALON_WORK_DIR || process.cwd();
 
 	mkdirSync(guestDir, { recursive: true });
-	writeFileSync(join(salonDir, "host.pid"), String(process.pid));
 
 	let msgFileCounter = 0;
 	const msgCtx: MessageContext = {
@@ -915,8 +988,16 @@ export default function salonExtension(pi: ExtensionAPI) {
 		writeGuestRuntimeFile(guest);
 		persistSalonState();
 		// Interrupt first, then exit the shell explicitly so the wrapper can report the final session id.
-		runtime.interrupt(guest.runtimeId);
-		runtime.terminate(guest.runtimeId, guest.type);
+		try {
+			runtime.interrupt(guest.runtimeId);
+			runtime.terminate(guest.runtimeId, guest.type);
+		} catch (error) {
+			if (!runtime.isAlive(guest.runtimeId)) {
+				settleGuestExitWaiter(guest.name);
+				return waitForExit;
+			}
+			throw error;
+		}
 		return waitForExit;
 	}
 
@@ -1625,6 +1706,38 @@ When these appear, process them thoughtfully — don't just echo them to the use
 	// ── Receive guest responses via Unix socket ──────────────────────
 	const socketPath = join(salonDir, "salon.sock");
 	let messageServer: Server | undefined;
+	let ownsMessageSocket = false;
+
+	function unlinkIfExists(path: string) {
+		if (!existsSync(path)) return;
+		unlinkSync(path);
+	}
+
+	async function closeSalonMessageServer() {
+		const server = messageServer;
+		const ownedSocket = ownsMessageSocket;
+		messageServer = undefined;
+		ownsMessageSocket = false;
+
+		if (server) {
+			await new Promise<void>((resolve, reject) => {
+				server.close((error) => {
+					if (error) {
+						reject(error);
+						return;
+					}
+					resolve();
+				});
+			});
+		}
+
+		if (!ownedSocket) return;
+
+		if (readHostPidForSocket(socketPath) === process.pid) {
+			unlinkIfExists(hostPidPath);
+		}
+		unlinkIfExists(socketPath);
+	}
 
 	function restoreSalonSession(ctx: { sessionManager: { getBranch(): Array<{ type?: string; customType?: string; data?: unknown }> } }) {
 		clearRuntimeState();
@@ -1646,9 +1759,9 @@ When these appear, process them thoughtfully — don't just echo them to the use
 		}
 	}
 
-	function openSalonMessageServer() {
-		messageServer?.close();
-		messageServer = startMessageServer(socketPath, (msg) => {
+	async function openSalonMessageServer() {
+		await closeSalonMessageServer();
+		messageServer = await startMessageServer(socketPath, (msg) => {
 			// Handle guest lifecycle events
 			if (msg.from === "_system" && msg.content.startsWith("guest_ready:")) {
 				const name = msg.content.slice("guest_ready:".length);
@@ -1696,7 +1809,11 @@ When these appear, process them thoughtfully — don't just echo them to the use
 					removeGuestFromDiscussion(name);
 					persistSalonState();
 					settleGuestExitWaiter(name);
-					runtime.equalize();
+					try {
+						runtime.equalize();
+					} catch {
+						// The tmux session may already be shutting down; the guest state update above is the important part.
+					}
 					const resumeHint = inactiveGuest.sessionId ? ` Session saved — use resume_guest to bring them back.` : "";
 					const queueHint = droppedQueuedCount > 0 ? ` ${droppedQueuedCount} queued message(s) were never delivered.` : "";
 					const exitLabel = inactiveGuest.lifecycleStatus === "suspended" ? "has been suspended" : "has left the salon";
@@ -1723,6 +1840,8 @@ When these appear, process them thoughtfully — don't just echo them to the use
 				pi.sendUserMessage(`[${msg.from}]: ${msg.content}`, { deliverAs: "followUp" });
 			}
 		});
+		ownsMessageSocket = true;
+		writeFileSync(hostPidPath, String(process.pid));
 	}
 
 	async function teardownSalonSession(options: { killTmuxSession: boolean }) {
@@ -1751,8 +1870,7 @@ When these appear, process them thoughtfully — don't just echo them to the use
 		}
 		persistSalonState();
 
-		messageServer?.close();
-		if (existsSync(socketPath)) unlinkSync(socketPath);
+		await closeSalonMessageServer();
 		if (options.killTmuxSession) {
 			runtime.destroySession();
 		}
@@ -1766,14 +1884,14 @@ When these appear, process them thoughtfully — don't just echo them to the use
 		return { cancel: false };
 	});
 
-	pi.on("session_start", (_event, ctx) => {
+	pi.on("session_start", async (_event, ctx) => {
 		restoreSalonSession(ctx);
-		openSalonMessageServer();
+		await openSalonMessageServer();
 	});
 
-	pi.on("session_switch", (_event, ctx) => {
+	pi.on("session_switch", async (_event, ctx) => {
 		restoreSalonSession(ctx);
-		openSalonMessageServer();
+		await openSalonMessageServer();
 	});
 
 	// ── Slash commands ────────────────────────────────────────────────
@@ -1803,14 +1921,18 @@ When these appear, process them thoughtfully — don't just echo them to the use
 	pi.registerCommand("next", {
 		description: "Jump to the next guest waiting for input (approval)",
 		handler: async (_args, ctx) => {
-			for (const [, guest] of guests) {
-				if (guest.lifecycleStatus !== "active") continue;
-				if (runtime.getStatus(guest.runtimeId) === "input") {
-					runtime.focus(guest.runtimeId);
-					ctx.ui.notify(`Switched to ${guest.name} (needs input)`, "info");
-					return;
+				for (const [, guest] of guests) {
+					if (guest.lifecycleStatus !== "active") continue;
+					if (runtime.getStatus(guest.runtimeId) === "input") {
+						try {
+							runtime.focus(guest.runtimeId);
+							ctx.ui.notify(`Switched to ${guest.name} (needs input)`, "info");
+						} catch {
+							ctx.ui.notify(`Guest ${guest.name} is no longer available.`, "warning");
+						}
+						return;
+					}
 				}
-			}
 			ctx.ui.notify("No guests waiting for input", "info");
 		},
 	});
@@ -1835,6 +1957,7 @@ export const __test__ = {
 	inviteGuest,
 	sayToGuestImpl,
 	flushQueuedGuestMessagesImpl,
+	startMessageServer,
 	guests,
 	queuedGuestMessages,
 };

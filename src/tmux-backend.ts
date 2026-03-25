@@ -22,6 +22,31 @@ function terminateCommandForGuestType(type: "claude" | "codex"): string {
 	return type === "claude" ? "/exit" : "exit";
 }
 
+function tmuxErrorDetail(error: unknown): string {
+	if (!(error instanceof Error)) return String(error);
+	const execError = error as Error & { stderr?: Buffer | string };
+	const stderr = typeof execError.stderr === "string"
+		? execError.stderr.trim()
+		: Buffer.isBuffer(execError.stderr)
+			? execError.stderr.toString("utf-8").trim()
+			: "";
+	return stderr || error.message;
+}
+
+function isTmuxMissingSessionError(error: unknown): boolean {
+	return tmuxErrorDetail(error).toLowerCase().includes("can't find session");
+}
+
+function runTmux(args: string[], mode: "required" | "tolerant"): string {
+	try {
+		return execFileSync("tmux", args, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).trim();
+	} catch (error) {
+		if (mode === "tolerant") return "";
+		const detail = tmuxErrorDetail(error);
+		throw new Error(`tmux ${args.join(" ")} failed${detail ? `: ${detail}` : ""}`);
+	}
+}
+
 export class TmuxBackend implements GuestRuntime {
 	private readonly tmuxSession: string;
 
@@ -60,17 +85,17 @@ export class TmuxBackend implements GuestRuntime {
 	}
 
 	interrupt(runtimeId: string): void {
-		this.tmux(["send-keys", "-t", runtimeId, "C-c"]);
-		this.tmux(["send-keys", "-t", runtimeId, "C-c"]);
+		this.tmuxCommand(["send-keys", "-t", runtimeId, "C-c"]);
+		this.tmuxCommand(["send-keys", "-t", runtimeId, "C-c"]);
 	}
 
 	terminate(runtimeId: string, guestType: "claude" | "codex"): void {
-		this.tmux(["send-keys", "-t", runtimeId, "-l", terminateCommandForGuestType(guestType)]);
-		this.tmux(["send-keys", "-t", runtimeId, "Enter"]);
+		this.tmuxCommand(["send-keys", "-t", runtimeId, "-l", terminateCommandForGuestType(guestType)]);
+		this.tmuxCommand(["send-keys", "-t", runtimeId, "Enter"]);
 	}
 
 	getStatus(runtimeId: string): GuestStatus {
-		const content = this.tmux(["capture-pane", "-t", runtimeId, "-p"]);
+		const content = this.tmuxStatusQuery(["capture-pane", "-t", runtimeId, "-p"]);
 		if (!content) return "new";
 
 		let linesChecked = 0;
@@ -115,49 +140,66 @@ export class TmuxBackend implements GuestRuntime {
 	}
 
 	isAlive(runtimeId: string): boolean {
-		return this.listAlive().includes(runtimeId);
+		return this.listAliveBestEffort().includes(runtimeId);
 	}
 
 	focus(runtimeId: string): void {
-		this.tmux(["select-pane", "-t", runtimeId]);
+		this.tmuxCommand(["select-pane", "-t", runtimeId]);
 	}
 
 	equalize(): void {
-		const panes = this.listAlive();
+		const panes = this.listAliveRequired();
 		if (panes.length <= 1) return;
-		const totalWidth = this.tmux(["display-message", "-t", `${this.tmuxSession}:0`, "-p", "#{window_width}"]);
-		const halfWidth = Math.floor(Number(totalWidth) / 2);
-		this.tmux(["set-option", "-t", `${this.tmuxSession}:0`, "main-pane-width", String(halfWidth)]);
-		this.tmux(["select-layout", "-t", `${this.tmuxSession}:0`, "main-vertical"]);
-		this.tmux(["select-pane", "-t", `${this.tmuxSession}:0.0`]);
+		const totalWidth = this.tmuxControlQuery(["display-message", "-t", `${this.tmuxSession}:0`, "-p", "#{window_width}"]);
+		const width = Number(totalWidth);
+		if (!Number.isFinite(width) || width <= 0) {
+			throw new Error(`Invalid tmux window width '${totalWidth}' for session '${this.tmuxSession}'.`);
+		}
+		const halfWidth = Math.floor(width / 2);
+		this.tmuxCommand(["set-option", "-t", `${this.tmuxSession}:0`, "main-pane-width", String(halfWidth)]);
+		this.tmuxCommand(["select-layout", "-t", `${this.tmuxSession}:0`, "main-vertical"]);
+		this.tmuxCommand(["select-pane", "-t", `${this.tmuxSession}:0.0`]);
 	}
 
 	destroySession(): void {
-		this.tmux(["kill-session", "-t", this.tmuxSession]);
+		try {
+			this.tmuxCommand(["kill-session", "-t", this.tmuxSession]);
+		} catch (error) {
+			if (isTmuxMissingSessionError(error)) return;
+			throw error;
+		}
 	}
 
 	// ── Internal helpers ─────────────────────────────────────────────
 
-	private listAlive(): string[] {
-		return this.tmux(["list-panes", "-t", `${this.tmuxSession}:0`, "-F", "#{pane_id}"]).split("\n").filter(Boolean);
+	private listAliveRequired(): string[] {
+		return this.tmuxControlQuery(["list-panes", "-t", `${this.tmuxSession}:0`, "-F", "#{pane_id}"]).split("\n").filter(Boolean);
 	}
 
-	private tmux(args: string[]): string {
-		try {
-			return execFileSync("tmux", args, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).trim();
-		} catch {
-			return "";
-		}
+	private listAliveBestEffort(): string[] {
+		return this.tmuxStatusQuery(["list-panes", "-t", `${this.tmuxSession}:0`, "-F", "#{pane_id}"]).split("\n").filter(Boolean);
+	}
+
+	private tmuxStatusQuery(args: string[]): string {
+		return runTmux(args, "tolerant");
+	}
+
+	private tmuxControlQuery(args: string[]): string {
+		return runTmux(args, "required");
+	}
+
+	private tmuxCommand(args: string[]): string {
+		return runTmux(args, "required");
 	}
 
 	private spawnPane(workDir: string): string {
-		const panes = this.listAlive();
+		const panes = this.listAliveRequired();
 		let newPaneId: string;
 		if (panes.length <= 1) {
-			newPaneId = this.tmux(["split-window", "-h", "-t", `${this.tmuxSession}:0.0`, "-p", "50", "-c", workDir, "-P", "-F", "#{pane_id}"]);
+			newPaneId = this.tmuxCommand(["split-window", "-h", "-t", `${this.tmuxSession}:0.0`, "-p", "50", "-c", workDir, "-P", "-F", "#{pane_id}"]);
 		} else {
 			const lastPane = panes[panes.length - 1];
-			newPaneId = this.tmux(["split-window", "-v", "-t", lastPane, "-c", workDir, "-P", "-F", "#{pane_id}"]);
+			newPaneId = this.tmuxCommand(["split-window", "-v", "-t", lastPane, "-c", workDir, "-P", "-F", "#{pane_id}"]);
 		}
 		this.equalize();
 		return newPaneId;
@@ -180,10 +222,13 @@ export class TmuxBackend implements GuestRuntime {
 
 		this.sendActive.add(paneId);
 		const item = queue.shift()!;
-		this.tmux(["send-keys", "-l", "-t", paneId, item.text]);
+		this.tmuxCommand(["send-keys", "-l", "-t", paneId, item.text]);
 		setTimeout(() => {
-			this.tmux(["send-keys", "-t", paneId, item.submitKey]);
-			this.sendActive.delete(paneId);
+			try {
+				this.tmuxCommand(["send-keys", "-t", paneId, item.submitKey]);
+			} finally {
+				this.sendActive.delete(paneId);
+			}
 			this.drainSendQueue(paneId);
 		}, 200);
 	}
@@ -266,16 +311,21 @@ export class TmuxLauncher implements SalonLauncher {
 
 	createSession(workDir: string): void {
 		if (!this.sessionExists()) {
-			this.tmux(["new-session", "-d", "-s", this.tmuxSession, "-x", "200", "-y", "50", "-c", workDir]);
+			this.tmuxCommand(["new-session", "-d", "-s", this.tmuxSession, "-x", "200", "-y", "50", "-c", workDir]);
 		}
-		this.tmux(["set-option", "-t", this.tmuxSession, "-g", "mouse", "on"]);
-		this.tmux(["set-option", "-t", this.tmuxSession, "-g", "extended-keys", "on"]);
-		this.tmux(["set-option", "-t", this.tmuxSession, "-g", "extended-keys-format", "csi-u"]);
-		this.tmux(["rename-window", "-t", `${this.tmuxSession}:0`, "salon"]);
+		this.tmuxCommand(["set-option", "-t", this.tmuxSession, "-g", "mouse", "on"]);
+		this.tmuxCommand(["set-option", "-t", this.tmuxSession, "-g", "extended-keys", "on"]);
+		this.tmuxCommand(["set-option", "-t", this.tmuxSession, "-g", "extended-keys-format", "csi-u"]);
+		this.tmuxCommand(["rename-window", "-t", `${this.tmuxSession}:0`, "salon"]);
 	}
 
 	destroySession(): void {
-		this.tmux(["kill-session", "-t", this.tmuxSession]);
+		try {
+			this.tmuxCommand(["kill-session", "-t", this.tmuxSession]);
+		} catch (error) {
+			if (isTmuxMissingSessionError(error)) return;
+			throw error;
+		}
 	}
 
 	attach(): void {
@@ -284,22 +334,18 @@ export class TmuxLauncher implements SalonLauncher {
 
 	setEnvironment(vars: Record<string, string>): void {
 		for (const [key, value] of Object.entries(vars)) {
-			this.tmux(["set-environment", "-t", this.tmuxSession, key, value]);
+			this.tmuxCommand(["set-environment", "-t", this.tmuxSession, key, value]);
 		}
 	}
 
 	launchHost(command: string): void {
 		const hostPane = `${this.tmuxSession}:0.0`;
 		const envSetup = `eval "$(tmux show-environment -t ${shellQuote(this.tmuxSession)} -s)" && export PATH="$SALON_NODE_BIN:$PATH"`;
-		this.tmux(["send-keys", "-t", hostPane, "-l", `${envSetup} && exec ${command}`]);
-		this.tmux(["send-keys", "-t", hostPane, "Enter"]);
+		this.tmuxCommand(["send-keys", "-t", hostPane, "-l", `${envSetup} && exec ${command}`]);
+		this.tmuxCommand(["send-keys", "-t", hostPane, "Enter"]);
 	}
 
-	private tmux(args: string[]): string {
-		try {
-			return execFileSync("tmux", args, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).trim();
-		} catch {
-			return "";
-		}
+	private tmuxCommand(args: string[]): string {
+		return runTmux(args, "required");
 	}
 }

@@ -46,7 +46,7 @@ function cleanup() {
 }
 
 // Start a test socket server, returns received messages
-function startTestServer(): { server: Server; messages: Array<{ from: string; content: string }>; close: () => void } {
+function startTestServer(): { server: Server; messages: Array<{ from: string; content: string }>; close: () => Promise<void> } {
 	const messages: Array<{ from: string; content: string }> = [];
 	if (existsSync(SOCK_PATH)) unlinkSync(SOCK_PATH);
 	const server = createServer((conn) => {
@@ -60,7 +60,14 @@ function startTestServer(): { server: Server; messages: Array<{ from: string; co
 		});
 	});
 	server.listen(SOCK_PATH);
-	return { server, messages, close: () => { server.close(); if (existsSync(SOCK_PATH)) unlinkSync(SOCK_PATH); } };
+	return {
+		server,
+		messages,
+		close: async () => {
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+			if (existsSync(SOCK_PATH)) unlinkSync(SOCK_PATH);
+		},
+	};
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -129,7 +136,7 @@ console.log("\n== 4. Unix socket IPC — hook sends to server ==");
 	assert("Codex message received via socket", messages.length === 2);
 	assert("Codex message content", messages[1]?.content === "hello from codex");
 
-	close();
+	await close();
 }
 
 console.log("\n== 5. Hook skips non-salon instances ==");
@@ -150,7 +157,7 @@ console.log("\n== 5. Hook skips non-salon instances ==");
 	await sleep(300);
 	assert("No message when no SALON_GUEST_NAME", messages.length === 0);
 
-	close();
+	await close();
 }
 
 console.log("\n== 6. Hook skips non-response Codex events ==");
@@ -169,7 +176,7 @@ console.log("\n== 6. Hook skips non-response Codex events ==");
 	await sleep(300);
 	assert("Non-response event skipped", messages.length === 0);
 
-	close();
+	await close();
 }
 
 console.log("\n== 7. Hook skips when no socket ==");
@@ -186,6 +193,35 @@ console.log("\n== 7. Hook skips when no socket ==");
 		exitCode = e.status ?? 1;
 	}
 	assert("Hook exits cleanly when no socket", exitCode === 0);
+}
+
+console.log("\n== 7b. startMessageServer refuses an active socket owner ==");
+{
+	const hookPath = join(SCRIPT_DIR, "hooks", "agent-response.sh");
+	const { startMessageServer } = extensionTest;
+	const { messages, close } = startTestServer();
+	await sleep(200);
+
+	let threw = false;
+	try {
+		await startMessageServer(SOCK_PATH, () => {});
+	} catch (error) {
+		threw = String(error).includes("already");
+	}
+
+	assert("startMessageServer rejects active socket reuse", threw);
+
+	try {
+		execSync(
+			`echo '{"last_assistant_message":"socket still alive"}' | SALON_GUEST_NAME=active-sock SALON_DIR="${SALON_DIR}" bash "${hookPath}"`,
+			{ stdio: "pipe", timeout: 5000 },
+		);
+	} catch { /* ignore */ }
+
+	await sleep(300);
+	assert("Original socket server still receives messages", messages[0]?.content === "socket still alive");
+
+	await close();
 }
 
 console.log("\n== 8. tmux pane management ==");
@@ -352,7 +388,7 @@ console.log("\n== 14. Wrapper ready watcher sends guest_ready via socket ==");
 	);
 	assert("guest_ready event received via socket", readyMsgs.length === 1);
 
-	close();
+	await close();
 	tmux(`kill-session -t "${TMUX_SESSION}"`);
 }
 
