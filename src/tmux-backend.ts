@@ -10,6 +10,25 @@ import { chmodSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { GuestRuntime, GuestStatus, RuntimeSpawnOptions, SalonLauncher } from "./runtime.js";
 
+// ── TUI detection patterns ────────────────────────────────────────────
+// Centralized so that upstream TUI changes only require edits here.
+const TUI_PATTERNS = {
+	// Characters whose presence as the first char (with "…" elsewhere) indicates Claude Code is working.
+	claudeSpinnerChars: "\u273D\u2722\u2733\u2736\u23FA\u2726\u2727\u2728\u2729\u272A\u272B\u272C\u272D\u272E\u272F\u2730\u2731\u2732\u2734\u2735\u2737\u2738\u2739\u273A\u273B\u273C",
+	// Braille spinner characters used by Codex CLI while working.
+	codexSpinnerChars: "\u280B\u2819\u2839\u2838\u283C\u2834\u2826\u2827\u2807\u280F",
+	// Ellipsis accompanying Claude Code spinner lines.
+	ellipsis: "\u2026",
+	// Claude Code selection menu glyph (followed by a digit = approval menu).
+	selectionMenuGlyph: "\u276F",
+	// Text on the bottom bar of a Claude Code permission prompt.
+	permissionPromptText: "Esc to cancel",
+	// Codex CLI approval prompt pattern.
+	approvalPromptPattern: /\(y\/n\)/i,
+	// Extended regex for grep -qE in the bash ready-watcher script.
+	readyPromptGrepPattern: "\u276F|\u203A ",
+} as const;
+
 function shellQuote(value: string): string {
 	return `'${value.replace(/'/g, `'\\''`)}'`;
 }
@@ -105,30 +124,30 @@ export class TmuxBackend implements GuestRuntime {
 			if (!trimmed) continue;
 
 			// Input: permission prompt (Claude Code)
-			if (linesChecked === 0 && trimmed.includes("Esc to cancel")) {
+			if (linesChecked === 0 && trimmed.includes(TUI_PATTERNS.permissionPromptText)) {
 				return "input";
 			}
 
 			// Working: spinner characters with ellipsis (Claude Code)
 			const first = trimmed.charAt(0);
-			if ("\u273D\u2722\u2733\u2736\u23FA\u2726\u2727\u2728\u2729\u272A\u272B\u272C\u272D\u272E\u272F\u2730\u2731\u2732\u2734\u2735\u2737\u2738\u2739\u273A\u273B\u273C".includes(first) && trimmed.includes("\u2026")) {
+			if (TUI_PATTERNS.claudeSpinnerChars.includes(first) && trimmed.includes(TUI_PATTERNS.ellipsis)) {
 				return "working";
 			}
 
 			// Working: braille spinner (Codex CLI)
-			if ("\u280B\u2819\u2839\u2838\u283C\u2834\u2826\u2827\u2807\u280F".includes(first)) {
+			if (TUI_PATTERNS.codexSpinnerChars.includes(first)) {
 				return "working";
 			}
 
 			// Input: selection menu "❯ N." (Claude Code approval)
-			const idx = trimmed.indexOf("\u276F");
+			const idx = trimmed.indexOf(TUI_PATTERNS.selectionMenuGlyph);
 			if (idx >= 0) {
 				const after = trimmed.slice(idx + 1).trimStart();
 				if (/^\d/.test(after)) return "input";
 			}
 
 			// Input: approval prompt (Codex CLI)
-			if (linesChecked === 0 && /\(y\/n\)/i.test(trimmed)) {
+			if (linesChecked === 0 && TUI_PATTERNS.approvalPromptPattern.test(trimmed)) {
 				return "input";
 			}
 
@@ -254,7 +273,7 @@ export class TmuxBackend implements GuestRuntime {
 			`    if [ -n "$CURRENT_COMMAND" ] && [ "$CURRENT_COMMAND" != "bash" ] && [ "$CURRENT_COMMAND" != "zsh" ] && [ "$CURRENT_COMMAND" != "sh" ]; then`,
 			`      for _ in $(seq 1 60); do`,
 			`        PANE_CONTENT=$(tmux capture-pane -t "$TMUX_PANE" -p 2>/dev/null || true)`,
-			`        if printf '%s' "$PANE_CONTENT" | grep -qE '❯|› '; then`,
+			`        if printf '%s' "$PANE_CONTENT" | grep -qE '${TUI_PATTERNS.readyPromptGrepPattern}'; then`,
 			`          sleep 0.3`,
 			`          send_system_event "guest_ready:${options.name}"`,
 			`          exit 0`,
