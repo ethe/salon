@@ -17,6 +17,15 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { createServer, type Server } from "node:net";
 import type { GuestRuntime, GuestStatus } from "./runtime.js";
 import { TmuxBackend } from "./tmux-backend.js";
+import {
+	type Discussion, type DiscussionStage, type DiscussionCommand,
+	type PersistedDiscussion, type PersistedDiscussionRound,
+	serializeDiscussion, deserializeDiscussion,
+	handleMessage as discussionHandleMessage,
+	advance as discussionAdvance, type AdvanceAction,
+	submitSynthesisToGuests, finalize as discussionFinalize,
+	buildSummary as buildDiscussionSummary,
+} from "./discussion.js";
 
 const SALON_INSTANCE = process.env.SALON_INSTANCE || "default";
 const TMUX_SESSION = process.env.SALON_TMUX_SESSION || `salon-${SALON_INSTANCE}`;
@@ -62,23 +71,6 @@ interface Deferred<T> {
 // Guests that are not currently active but may still be resumable.
 const dismissedGuests = new Map<string, GuestRecord>();
 
-// ── Discussion state machine ──────────────────────────────────────────
-type DiscussionStage = "exploring" | "debating" | "synthesizing" | "done";
-
-interface DiscussionRound {
-	responses: Map<string, string>;  // guest name → their response this round
-}
-
-interface Discussion {
-	id: string;
-	topic: string;
-	guestA: string;
-	guestB: string;
-	stage: DiscussionStage;
-	rounds: DiscussionRound[];      // all rounds of exchange
-	currentRound: DiscussionRound;  // the round being collected
-}
-
 interface PersistedGuestInfo {
 	name: string;
 	type: GuestType;
@@ -87,20 +79,6 @@ interface PersistedGuestInfo {
 	nonce?: string;
 	startedAt?: string;
 	workspaceDir?: string;
-}
-
-interface PersistedDiscussionRound {
-	responses: Record<string, string>;
-}
-
-interface PersistedDiscussion {
-	id: string;
-	topic: string;
-	guestA: string;
-	guestB: string;
-	stage: DiscussionStage;
-	rounds: PersistedDiscussionRound[];
-	currentRound: PersistedDiscussionRound;
 }
 
 interface SalonStateSnapshot {
@@ -283,37 +261,6 @@ function getCodexSessionDateDirs(startedAt: number): string[] {
 	return Array.from(dirs);
 }
 
-function serializeDiscussionRound(round: DiscussionRound): PersistedDiscussionRound {
-	return { responses: Object.fromEntries(round.responses) };
-}
-
-function deserializeDiscussionRound(round: PersistedDiscussionRound | undefined): DiscussionRound {
-	return { responses: new Map(Object.entries(round?.responses || {})) };
-}
-
-function serializeDiscussion(disc: Discussion): PersistedDiscussion {
-	return {
-		id: disc.id,
-		topic: disc.topic,
-		guestA: disc.guestA,
-		guestB: disc.guestB,
-		stage: disc.stage,
-		rounds: disc.rounds.map(serializeDiscussionRound),
-		currentRound: serializeDiscussionRound(disc.currentRound),
-	};
-}
-
-function deserializeDiscussion(disc: PersistedDiscussion): Discussion {
-	return {
-		id: disc.id,
-		topic: disc.topic,
-		guestA: disc.guestA,
-		guestB: disc.guestB,
-		stage: disc.stage,
-		rounds: (disc.rounds || []).map(deserializeDiscussionRound),
-		currentRound: deserializeDiscussionRound(disc.currentRound),
-	};
-}
 
 interface CodexSessionMetaPayload {
 	id?: string;
@@ -946,7 +893,25 @@ export default function salonExtension(pi: ExtensionAPI) {
 		}
 	}
 
-	// ── Discussion state handler ──────────────────────────────────────
+	// ── Discussion command dispatcher ────────────────────────────────
+	function dispatchDiscussionCommands(commands: DiscussionCommand[]) {
+		for (const cmd of commands) {
+			switch (cmd.type) {
+				case "sendToGuest": {
+					const guest = guests.get(cmd.guestName);
+					if (guest) sayToGuest(guest, cmd.message, cmd.from);
+					break;
+				}
+				case "notifyHost":
+					pi.sendUserMessage(cmd.message, { deliverAs: "followUp" });
+					break;
+				case "persist":
+					persistSalonState();
+					break;
+			}
+		}
+	}
+
 	function handleDiscussionMessage(from: string, content: string) {
 		const discId = guestToDiscussion.get(from);
 		if (!discId) return false;
@@ -954,83 +919,9 @@ export default function salonExtension(pi: ExtensionAPI) {
 		const disc = discussions.get(discId);
 		if (!disc) return false;
 
-		// Collect response for current round
-		disc.currentRound.responses.set(from, content);
-
-		// Wait for both guests
-		if (!disc.currentRound.responses.has(disc.guestA) || !disc.currentRound.responses.has(disc.guestB)) {
-			const other = from === disc.guestA ? disc.guestB : disc.guestA;
-			pi.sendUserMessage(`[salon] "${disc.topic}" — ${from} has responded, waiting for ${other}.`, { deliverAs: "followUp" });
-			return true;
-		}
-
-		// Both responded — process the round
-		const responseA = disc.currentRound.responses.get(disc.guestA)!;
-		const responseB = disc.currentRound.responses.get(disc.guestB)!;
-		disc.rounds.push(disc.currentRound);
-		const roundNum = disc.rounds.length;
-
-		if (disc.stage === "exploring") {
-			// First round done — move to debating
-			disc.stage = "debating";
-
-			pi.sendUserMessage(`[salon] "${disc.topic}" — both guests have given initial proposals (round ${roundNum}). Cross-review starting.`, { deliverAs: "followUp" });
-
-			// Cross-share for review
-			const guestA = guests.get(disc.guestA)!;
-			const guestB = guests.get(disc.guestB)!;
-			sayToGuest(guestA, responseB, disc.guestB);
-			sayToGuest(guestB, responseA, disc.guestA);
-
-			disc.currentRound = { responses: new Map() };
-			persistSalonState();
-			return true;
-		}
-
-		if (disc.stage === "debating") {
-			// Deliver both responses to host — host decides what to do next via advance_discussion
-			pi.sendUserMessage(
-				`[salon] "${disc.topic}" — round ${roundNum} complete.\n\n` +
-				`[${disc.guestA}]: ${responseA}\n\n` +
-				`[${disc.guestB}]: ${responseB}\n\n` +
-				`Review both responses. Use advance_discussion to decide: "continue" (another debate round), "synthesize" (move to synthesis), or "ask_user" (escalate open questions to the user).`,
-				{ deliverAs: "followUp" },
-				);
-				disc.currentRound = { responses: new Map() };
-				persistSalonState();
-				return true;
-			}
-
-		if (disc.stage === "synthesizing") {
-			// Guests reviewed the host's synthesis — deliver feedback to host
-			pi.sendUserMessage(
-				`[salon] "${disc.topic}" — guests have reviewed your synthesis.\n\n` +
-				`[${disc.guestA}]: ${responseA}\n\n` +
-				`[${disc.guestB}]: ${responseB}\n\n` +
-				`If both guests approve, use finalize_discussion to complete. Otherwise revise and submit_synthesis again.`,
-				{ deliverAs: "followUp" },
-				);
-				disc.currentRound = { responses: new Map() };
-				persistSalonState();
-				return true;
-			}
-
-		return false;
-	}
-
-	function buildDiscussionSummary(disc: Discussion): string {
-		const parts: string[] = [];
-		for (let i = 0; i < disc.rounds.length; i++) {
-			const round = disc.rounds[i];
-			const label = i === 0 ? "Initial proposals" : `Round ${i + 1}`;
-			parts.push(`── ${label} ──`);
-			const a = round.responses.get(disc.guestA);
-			const b = round.responses.get(disc.guestB);
-			if (a) parts.push(`[${disc.guestA}]: ${a}`);
-			if (b) parts.push(`[${disc.guestB}]: ${b}`);
-			parts.push("");
-		}
-		return parts.join("\n");
+		const { handled, commands } = discussionHandleMessage(disc, from, content);
+		dispatchDiscussionCommands(commands);
+		return handled;
 	}
 
 	function buildRecoveredSalonSummary(): string | undefined {
@@ -1275,31 +1166,23 @@ export default function salonExtension(pi: ExtensionAPI) {
 				throw new Error(`No active discussion in debating stage for topic "${params.topic}"`);
 			}
 
-			const guestA = guests.get(targetDisc.guestA);
-			const guestB = guests.get(targetDisc.guestB);
-			if (!guestA || !guestB) throw new Error("Discussion guests no longer available");
+			if (!guests.has(targetDisc.guestA) || !guests.has(targetDisc.guestB)) {
+				throw new Error("Discussion guests no longer available");
+			}
 
-			if (params.action === "continue") {
-				// Send each guest the other's latest response for another round
-				const lastRound = targetDisc.rounds[targetDisc.rounds.length - 1];
-				const lastA = lastRound?.responses.get(targetDisc.guestA) || "";
-				const lastB = lastRound?.responses.get(targetDisc.guestB) || "";
-				if (params.message) {
-					sayToGuest(guestA, `${params.message}\n\n${lastB}`, targetDisc.guestB);
-					sayToGuest(guestB, `${params.message}\n\n${lastA}`, targetDisc.guestA);
-				} else {
-					sayToGuest(guestA, lastB, targetDisc.guestB);
-					sayToGuest(guestB, lastA, targetDisc.guestA);
-				}
+			const action = params.action as AdvanceAction;
+			const { commands } = discussionAdvance(targetDisc, action, params.message);
+
+			if (action === "continue") {
+				dispatchDiscussionCommands(commands);
 				return {
 					content: [{ type: "text" as const, text: `Debate continues — round ${targetDisc.rounds.length + 1} started.` }],
 					details: {},
 				};
 			}
 
-			if (params.action === "synthesize") {
-				targetDisc.stage = "synthesizing";
-				persistSalonState();
+			if (action === "synthesize") {
+				dispatchDiscussionCommands(commands);
 				const summary = buildDiscussionSummary(targetDisc);
 				return {
 					content: [{ type: "text" as const, text: `Discussion "${params.topic}" moved to synthesis stage. Write your synthesis and use submit_synthesis.\n\n${summary}` }],
@@ -1307,11 +1190,10 @@ export default function salonExtension(pi: ExtensionAPI) {
 				};
 			}
 
-			if (params.action === "ask_user") {
-				targetDisc.stage = "done";
+			if (action === "ask_user") {
 				const summary = buildDiscussionSummary(targetDisc);
 				cleanupDiscussion(targetId, targetDisc);
-				persistSalonState();
+				dispatchDiscussionCommands(commands);
 				return {
 					content: [{ type: "text" as const, text: `Discussion paused. Open questions for the user:\n\n${params.message || "(no specific questions provided)"}\n\nFull discussion:\n${summary}` }],
 					details: {},
@@ -1334,28 +1216,23 @@ export default function salonExtension(pi: ExtensionAPI) {
 			synthesis: Type.String({ description: "Your synthesis text" }),
 		}),
 		async execute(_id, params: any) {
-			// Find the discussion in synthesizing stage
 			let targetDisc: Discussion | undefined;
-			let targetId: string | undefined;
-			for (const [id, disc] of discussions) {
+			for (const [, disc] of discussions) {
 				if (disc.topic === params.topic && disc.stage === "synthesizing") {
 					targetDisc = disc;
-					targetId = id;
 					break;
 				}
 			}
-			if (!targetDisc || !targetId) {
+			if (!targetDisc) {
 				throw new Error(`No discussion in synthesizing stage for topic "${params.topic}"`);
 			}
 
-			const guestA = guests.get(targetDisc.guestA);
-			const guestB = guests.get(targetDisc.guestB);
-			if (!guestA || !guestB) throw new Error("Discussion guests no longer available");
+			if (!guests.has(targetDisc.guestA) || !guests.has(targetDisc.guestB)) {
+				throw new Error("Discussion guests no longer available");
+			}
 
-			// Send synthesis to both guests for review
-			const reviewPrompt = `The host has synthesized the discussion on "${params.topic}". Please review this synthesis. If you agree it's accurate and complete, say so. If you have objections or corrections, state them clearly.\n\n${params.synthesis}`;
-			sayToGuest(guestA, reviewPrompt);
-			sayToGuest(guestB, reviewPrompt);
+			const { commands } = submitSynthesisToGuests(targetDisc, params.synthesis);
+			dispatchDiscussionCommands(commands);
 
 			return {
 				content: [{ type: "text" as const, text: `Synthesis sent to both guests for confirmation. Waiting for their review.` }],
@@ -1385,9 +1262,9 @@ export default function salonExtension(pi: ExtensionAPI) {
 			if (!targetDisc || !targetId) {
 				throw new Error(`No discussion in synthesizing stage for topic "${params.topic}"`);
 			}
-			targetDisc.stage = "done";
+			const { commands } = discussionFinalize(targetDisc);
 			cleanupDiscussion(targetId, targetDisc);
-			persistSalonState();
+			dispatchDiscussionCommands(commands);
 			return {
 				content: [{ type: "text" as const, text: `Discussion "${params.topic}" finalized.` }],
 				details: {},
