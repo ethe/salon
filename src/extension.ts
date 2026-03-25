@@ -1693,11 +1693,11 @@ When you need two guests to explore a topic, ALWAYS use the discuss tool. Never 
 ## Guest type characteristics
 Based on observed behavior patterns:
 
-- **Claude Code guests** tend to excel at **strategic / macro-level thinking**: holistic evaluation frameworks, ecosystem positioning, meta-analysis during cross-review, and identifying architectural insights. They tend to be more generous in assessment and better at "finding problems within affirmation."
+- **Claude Code guests** tend to excel at **fine-grained cross-review and analytical layering**: dissecting proposals into sub-cases, identifying where a blanket judgment needs nuance, and revising their own positions clearly when challenged. Their initial assessments tend to under-probe — accepting surface adequacy where deeper scrutiny would reveal issues. Their initial exploration produces a mix of solid findings and under-examined calls; cross-review is where the soft calls get corrected and the solid ones sharpened.
 
-- **Codex CLI guests** tend to excel at **engineering detail and empirical verification**: actually running builds/tests, catching specific risks (shell injection, config safety, test coverage gaps), rigorous wording, and grounded competitive analysis. They tend to be more conservative in assessment and better at "finding highlights within skepticism."
+- **Codex CLI guests** tend to excel at **system-level risk assessment and priority ranking**: identifying which problems have the largest blast radius, tracing consequence chains (e.g., "error swallowing → observability loss → state divergence"), and catching functional regressions during code review. They tend to be more conservative in assessment but can over-engineer solutions (e.g., proposing new lifecycle states where a simple check suffices). Their macro-level judgment on "what matters most" is typically stronger, but specific implementation proposals sometimes need to be pulled back to simpler alternatives.
 
-These are complementary perspectives. Use this to guide guest selection:
+These are complementary perspectives — they tend to err in different directions. Claude Code may initially underrate a problem; Codex CLI may propose an overly complex fix. Cross-review between the two reliably converges to a better position than either alone. Use this to guide guest selection:
 - For architecture, strategy, or positioning → prefer claude
 - For implementation, verification, or security review → prefer codex
 - For open-ended evaluation → use discuss (one of each) to get both perspectives
