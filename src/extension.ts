@@ -7,6 +7,7 @@
  * Run: pi --extension ./src/extension.ts
  */
 
+import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { randomUUID } from "node:crypto";
@@ -31,6 +32,7 @@ const SALON_INSTANCE = process.env.SALON_INSTANCE || "default";
 const TMUX_SESSION = process.env.SALON_TMUX_SESSION || `salon-${SALON_INSTANCE}`;
 const SALON_STATE_ENTRY_TYPE = "salon_state";
 const SALON_STATE_VERSION = 1;
+const SALON_STATUS_MESSAGE_TYPE = "salon-status";
 type GuestType = "claude" | "codex";
 type GuestTeardownReason = "host" | "user";
 type GuestLifecycleStatus = "active" | "dismissing" | "suspended" | "dismissed";
@@ -59,6 +61,7 @@ interface GuestRecord {
 interface GuestRuntimeHandle {
 	runtimeId: string;
 	ready: boolean;
+	eventStatus?: "working" | "idle";
 }
 
 type Guest = GuestRecord & GuestRuntimeHandle;
@@ -130,6 +133,47 @@ function sanitizeGuestName(name: string): string {
 function safeLabelForFilename(value: string): string {
 	const sanitized = value.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
 	return sanitized || "guest";
+}
+
+// ── Message send/queue (module-level for testability) ─────────────────
+
+interface MessageContext {
+	runtime: GuestRuntime;
+	salonDir: string;
+	getMsgFileCounter: () => number;
+	incMsgFileCounter: () => number;
+	msgLengthThreshold: number;
+}
+
+function sayToGuestImpl(ctx: MessageContext, guest: Guest, message: string, from = "host"): "queued" | "sent" {
+	if (!guest.ready) {
+		const queued = queuedGuestMessages.get(guest.name) || [];
+		queued.push({ message, from });
+		queuedGuestMessages.set(guest.name, queued);
+		return "queued" as const;
+	}
+
+	guest.eventStatus = "working";
+	const prefix = `[${from}]: `;
+	if (message.length <= ctx.msgLengthThreshold) {
+		ctx.runtime.send(guest.runtimeId, `${prefix}${message}`);
+	} else {
+		const exchangeDir = join(ctx.salonDir, "exchange");
+		mkdirSync(exchangeDir, { recursive: true });
+		const msgFile = join(exchangeDir, `${ctx.incMsgFileCounter()}_${safeLabelForFilename(from)}.md`);
+		writeFileSync(msgFile, message);
+		ctx.runtime.send(guest.runtimeId, `${prefix}Read ${msgFile} and respond.`);
+	}
+	return "sent" as const;
+}
+
+function flushQueuedGuestMessagesImpl(ctx: MessageContext, guest: Guest) {
+	const queued = queuedGuestMessages.get(guest.name);
+	if (!queued?.length) return;
+	queuedGuestMessages.delete(guest.name);
+	for (const item of queued) {
+		sayToGuestImpl(ctx, guest, item.message, item.from);
+	}
 }
 
 function cancelCodexSessionScan(name: string) {
@@ -461,8 +505,14 @@ export default function salonExtension(pi: ExtensionAPI) {
 	mkdirSync(guestDir, { recursive: true });
 	writeFileSync(join(salonDir, "host.pid"), String(process.pid));
 
-	const MSG_LENGTH_THRESHOLD = 2000;
 	let msgFileCounter = 0;
+	const msgCtx: MessageContext = {
+		runtime,
+		salonDir,
+		getMsgFileCounter: () => msgFileCounter,
+		incMsgFileCounter: () => ++msgFileCounter,
+		msgLengthThreshold: 2000,
+	};
 	let pendingResumeSummary: string | undefined;
 
 	pi.on("session_directory", () => {
@@ -775,6 +825,13 @@ export default function salonExtension(pi: ExtensionAPI) {
 	function getGuestDisplayStatus(guest: Guest): string {
 		if (guest.lifecycleStatus === "dismissing") return "dismissing";
 		if (!guest.ready) return "starting";
+		if (guest.eventStatus === "working") {
+			// Refine: detect if the guest is actually waiting for tool approval
+			const paneStatus = runtime.getStatus(guest.runtimeId);
+			return paneStatus === "input" ? "input" : "working";
+		}
+		if (guest.eventStatus === "idle") return "idle";
+		// No event yet (freshly spawned) — fall back to pane scraping
 		return runtime.getStatus(guest.runtimeId);
 	}
 
@@ -841,38 +898,16 @@ export default function salonExtension(pi: ExtensionAPI) {
 		persistSalonState();
 		// Interrupt first, then exit the shell explicitly so the wrapper can report the final session id.
 		runtime.interrupt(guest.runtimeId);
-		runtime.terminate(guest.runtimeId);
+		runtime.terminate(guest.runtimeId, guest.type);
 		return waitForExit;
 	}
 
 	function flushQueuedGuestMessages(guest: Guest) {
-		const queued = queuedGuestMessages.get(guest.name);
-		if (!queued?.length) return;
-		queuedGuestMessages.delete(guest.name);
-		for (const item of queued) {
-			sayToGuest(guest, item.message, item.from);
-		}
+		flushQueuedGuestMessagesImpl(msgCtx, guest);
 	}
 
-	function sayToGuest(guest: Guest, message: string, from = "host") {
-		if (!guest.ready) {
-			const queued = queuedGuestMessages.get(guest.name) || [];
-			queued.push({ message, from });
-			queuedGuestMessages.set(guest.name, queued);
-			return;
-		}
-
-		const prefix = `[${from}]: `;
-		if (message.length <= MSG_LENGTH_THRESHOLD) {
-			runtime.send(guest.runtimeId, `${prefix}${message}`);
-		} else {
-			// Long messages: write to file, send short reference via send-keys
-			const exchangeDir = join(salonDir, "exchange");
-			mkdirSync(exchangeDir, { recursive: true });
-			const msgFile = join(exchangeDir, `${++msgFileCounter}_${safeLabelForFilename(from)}.md`);
-			writeFileSync(msgFile, message);
-			runtime.send(guest.runtimeId, `${prefix}Read ${msgFile} and respond.`);
-		}
+	function sayToGuest(guest: Guest, message: string, from = "host"): "queued" | "sent" {
+		return sayToGuestImpl(msgCtx, guest, message, from);
 	}
 
 	// ── Discussion command dispatcher ────────────────────────────────
@@ -931,6 +966,37 @@ export default function salonExtension(pi: ExtensionAPI) {
 					guestB: discussion.guestB,
 				})),
 		});
+	}
+
+	function buildSalonStatusSnapshot(): string | undefined {
+		const lines: string[] = [];
+		for (const guest of guests.values()) {
+			const status = getGuestDisplayStatus(guest);
+			const discId = guestToDiscussion.get(guest.name);
+			const disc = discId ? discussions.get(discId) : undefined;
+			const discLabel = disc ? ` [discussing: ${disc.stage}]` : "";
+			lines.push(`  ${guest.name} (${guest.type}): ${status}${discLabel}`);
+		}
+		for (const guest of dismissedGuests.values()) {
+			if (guest.lifecycleStatus !== "suspended") continue;
+			lines.push(`  ${guest.name} (${guest.type}): ${guest.lifecycleStatus}${guest.sessionId ? " (session saved)" : ""}`);
+		}
+		if (lines.length === 0) return undefined;
+		return `[salon-status]\n${lines.join("\n")}\n[/salon-status]`;
+	}
+
+	function isSalonStatusContextMessage(message: AgentMessage): boolean {
+		return message.role === "custom" && message.customType === SALON_STATUS_MESSAGE_TYPE;
+	}
+
+	function createSalonStatusContextMessage(snapshot: string): AgentMessage {
+		return {
+			role: "custom",
+			customType: SALON_STATUS_MESSAGE_TYPE,
+			content: snapshot,
+			display: false,
+			timestamp: Date.now(),
+		};
 	}
 
 	function resumeInactiveGuest(name: string): Guest {
@@ -1032,29 +1098,48 @@ export default function salonExtension(pi: ExtensionAPI) {
 		description:
 			"Invite a guest agent (Claude Code or Codex CLI) to the salon. " +
 			"Use 'claude' for analysis, planning, code review, research, discussion. " +
-			"Use 'codex' for code generation, making edits, executing changes.",
+			"Use 'codex' for code generation, making edits, executing changes. " +
+			"After inviting, you may call say_to_guest immediately — if startup is still in progress, delivery is queued automatically.",
 		promptSnippet: "Invite a Claude Code or Codex CLI guest to the salon",
 		promptGuidelines: [
 			"Invite 'claude' for analysis, planning, code review, research, discussion",
 			"Invite 'codex' for code generation, edits, implementations",
+			"After invite_guest, you can say_to_guest immediately — do not wait for a ready notification because delivery queues automatically",
+			"Use initial_message when you already know the first task to delegate",
 			"Don't invite guests for simple questions you can answer directly",
 			"Invite multiple guests when tasks benefit from parallel work or different perspectives",
 		],
 		parameters: Type.Object({
 			type: Type.Union([Type.Literal("claude"), Type.Literal("codex")], { description: "Guest type" }),
 			name: Type.String({ description: "Unique guest name, e.g. 'researcher', 'reviewer'" }),
+			initial_message: Type.Optional(Type.String({
+				description: "Optional first message to send immediately after inviting. If the guest is still starting up, it will be queued automatically.",
+			})),
 		}),
 		async execute(_id, params: any) {
 			const guest = inviteGuest(params.name, params.type, workDir, salonDir, guestDir, runtime);
 			scanCodexSessionId(guest);
-				persistSalonState();
+			const initialMessageStatus = params.initial_message !== undefined
+				? sayToGuest(guest, params.initial_message)
+				: undefined;
+			persistSalonState();
 
-				return {
-					content: [{ type: "text" as const, text: `Invited ${params.type} guest '${params.name}' to the salon. Messages will queue until the guest reports ready.` }],
-					details: {},
-				};
-			},
-		});
+			const parts = [
+				`Invited ${params.type} guest '${params.name}' to the salon.`,
+				"You may call say_to_guest immediately — do not wait for a ready notification; messages queue automatically until startup completes.",
+			];
+			if (initialMessageStatus === "sent") {
+				parts.push(`Initial message sent to '${params.name}'.`);
+			} else if (initialMessageStatus === "queued") {
+				parts.push(`Initial message queued for '${params.name}'; it will be delivered automatically when startup completes.`);
+			}
+
+			return {
+				content: [{ type: "text" as const, text: parts.join(" ") }],
+				details: {},
+			};
+		},
+	});
 
 	pi.registerTool({
 		name: "discuss",
@@ -1267,9 +1352,14 @@ export default function salonExtension(pi: ExtensionAPI) {
 			const guest = guests.get(params.name);
 			if (!guest) throw new Error(`Guest '${params.name}' is not in the salon`);
 			if (guest.lifecycleStatus !== "active") throw new Error(`Guest '${params.name}' is not accepting new messages right now.`);
-			sayToGuest(guest, params.message);
+			const sendStatus = sayToGuest(guest, params.message);
 			return {
-				content: [{ type: "text" as const, text: `Said to '${params.name}'.` }],
+				content: [{
+					type: "text" as const,
+					text: sendStatus === "sent"
+						? `Sent to '${params.name}'.`
+						: `Queued for '${params.name}'; it will be delivered automatically when startup completes.`,
+				}],
 				details: {},
 			};
 		},
@@ -1278,18 +1368,25 @@ export default function salonExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "list_guests",
 		label: "List Guests",
-		description: "List all guests currently in the salon, with their status (working/input/idle/new).",
+		description: "List all guests in the salon — active, suspended, and dismissed — with their status.",
 		promptSnippet: "List guests in the salon with status",
 		parameters: Type.Object({}),
 		async execute() {
-			if (guests.size === 0) return { content: [{ type: "text" as const, text: "No guests in the salon." }], details: {} };
-			const lines = Array.from(guests.values()).map((g) => {
+			if (guests.size === 0 && dismissedGuests.size === 0) {
+				return { content: [{ type: "text" as const, text: "No guests in the salon." }], details: {} };
+			}
+			const lines: string[] = [];
+			for (const g of guests.values()) {
 				const status = getGuestDisplayStatus(g);
 				const discId = guestToDiscussion.get(g.name);
 				const disc = discId ? discussions.get(discId) : undefined;
 				const discLabel = disc ? ` [discussing: ${disc.stage}]` : "";
-				return `${g.name} (${g.type}) ${status}${discLabel} @ ${g.workspaceDir}`;
-			});
+				lines.push(`${g.name} (${g.type}) ${status}${discLabel} @ ${g.workspaceDir}`);
+			}
+			for (const g of dismissedGuests.values()) {
+				const resumable = g.sessionId ? " (resumable)" : "";
+				lines.push(`${g.name} (${g.type}) ${g.lifecycleStatus}${resumable} @ ${g.workspaceDir}`);
+			}
 			return { content: [{ type: "text" as const, text: lines.join("\n") }], details: {} };
 		},
 	});
@@ -1437,6 +1534,7 @@ When delegating execution tasks (invite_guest + say_to_guest, implementation wor
 - Start with WHAT: what is the project, what are we doing
 - Then WHY: why are we doing this, what problem does it solve, what's the current limitation
 - Then HOW: the specific task to execute
+- After invite_guest, send the first message immediately when you know the task. Do not wait for a ready notification — messages queue and flush automatically when startup completes.
 - A guest receiving an execution task should understand the full intent, not just a list of file changes.
 
 When facilitating discussion:
@@ -1464,7 +1562,7 @@ Guests persist after their task or discussion completes — finalize_discussion 
 When working with reviewers, follow this sequence strictly: implement → review → fix → confirm → commit. Never skip the confirmation step — after fixing reviewer feedback, always let the reviewer verify the fix before proceeding.
 
 ## Waiting for guests
-Guest responses are delivered to you automatically — you do NOT need to poll, check, or call list_guests in a loop. After sending a task via say_to_guest or starting a discuss, simply finish your current response. When a guest replies, it will appear as your next input message (e.g. [guest-name]: ...). Do nothing until then.
+Guest responses are delivered to you automatically — you do NOT need to poll, check, or call list_guests in a loop. After sending a task via say_to_guest, inviting with initial_message, or starting a discuss, simply finish your current response. When a guest replies, it will appear as your next input message (e.g. [guest-name]: ...). Do nothing until then.
 
 ## Keeping the user informed
 - Briefly tell the user what you're doing and why when starting collaboration
@@ -1491,32 +1589,14 @@ When these appear, process them thoughtfully — don't just echo them to the use
 		return { systemPrompt: hostPreamble + resumeSummary + basePrompt };
 	});
 
-	// ── Inject guest status snapshot into user messages ──────────────
-	pi.on("input", (event) => {
-		if (event.source !== "interactive") return { action: "continue" as const };
-
-		const lines: string[] = [];
-		for (const g of guests.values()) {
-			const status = getGuestDisplayStatus(g);
-			const discId = guestToDiscussion.get(g.name);
-			const disc = discId ? discussions.get(discId) : undefined;
-			const discLabel = disc ? ` [discussing: ${disc.stage}]` : "";
-			lines.push(`  ${g.name} (${g.type}): ${status}${discLabel}`);
+	pi.on("context", (event) => {
+		const messages = event.messages.filter((message) => !isSalonStatusContextMessage(message));
+		const salonStatusSnapshot = buildSalonStatusSnapshot();
+		if (!salonStatusSnapshot) {
+			return { messages };
 		}
-		for (const g of dismissedGuests.values()) {
-			if (g.lifecycleStatus !== "suspended") continue;
-			lines.push(`  ${g.name} (${g.type}): ${g.lifecycleStatus}${g.sessionId ? " (session saved)" : ""}`);
-		}
-
-		if (lines.length === 0) return { action: "continue" as const };
-
-		const snapshot = `[salon-status]\n${lines.join("\n")}\n[/salon-status]`;
-		const text = event.text ? snapshot + "\n\n" + event.text : snapshot;
-		return {
-			action: "transform" as const,
-			text,
-			images: event.images,
-		};
+		messages.push(createSalonStatusContextMessage(salonStatusSnapshot));
+		return { messages };
 	});
 
 	// ── Receive guest responses via Unix socket ──────────────────────
@@ -1611,6 +1691,9 @@ When these appear, process them thoughtfully — don't just echo them to the use
 				}
 				return;
 			}
+
+			const respondingGuest = guests.get(msg.from);
+			if (respondingGuest) respondingGuest.eventStatus = "idle";
 
 			const handled = handleDiscussionMessage(msg.from, msg.content);
 			if (!handled) {
@@ -1726,4 +1809,9 @@ When these appear, process them thoughtfully — don't just echo them to the use
 export const __test__ = {
 	formatRecoveredSalonSummary,
 	sanitizeGuestName,
+	inviteGuest,
+	sayToGuestImpl,
+	flushQueuedGuestMessagesImpl,
+	guests,
+	queuedGuestMessages,
 };

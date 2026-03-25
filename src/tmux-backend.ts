@@ -18,6 +18,10 @@ function submitKeyForGuestType(type: "claude" | "codex"): string {
 	return type === "codex" ? "C-m" : "Enter";
 }
 
+function terminateCommandForGuestType(type: "claude" | "codex"): string {
+	return type === "claude" ? "/exit" : "exit";
+}
+
 export class TmuxBackend implements GuestRuntime {
 	private readonly tmuxSession: string;
 
@@ -60,8 +64,8 @@ export class TmuxBackend implements GuestRuntime {
 		this.tmux(["send-keys", "-t", runtimeId, "C-c"]);
 	}
 
-	terminate(runtimeId: string): void {
-		this.tmux(["send-keys", "-t", runtimeId, "-l", "exit"]);
+	terminate(runtimeId: string, guestType: "claude" | "codex"): void {
+		this.tmux(["send-keys", "-t", runtimeId, "-l", terminateCommandForGuestType(guestType)]);
 		this.tmux(["send-keys", "-t", runtimeId, "Enter"]);
 	}
 
@@ -86,11 +90,21 @@ export class TmuxBackend implements GuestRuntime {
 				return "working";
 			}
 
+			// Working: braille spinner (Codex CLI)
+			if ("\u280B\u2819\u2839\u2838\u283C\u2834\u2826\u2827\u2807\u280F".includes(first)) {
+				return "working";
+			}
+
 			// Input: selection menu "❯ N." (Claude Code approval)
 			const idx = trimmed.indexOf("\u276F");
 			if (idx >= 0) {
 				const after = trimmed.slice(idx + 1).trimStart();
 				if (/^\d/.test(after)) return "input";
+			}
+
+			// Input: approval prompt (Codex CLI)
+			if (linesChecked === 0 && /\(y\/n\)/i.test(trimmed)) {
+				return "input";
 			}
 
 			linesChecked++;

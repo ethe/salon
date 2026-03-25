@@ -28,8 +28,8 @@ export interface GuestRuntime {
 	/** Interrupt a guest (e.g. Ctrl-C). */
 	interrupt(runtimeId: string): void;
 
-	/** Terminate a guest (e.g. send "exit" command). */
-	terminate(runtimeId: string): void;
+	/** Terminate a guest (e.g. send the runtime-appropriate exit command). */
+	terminate(runtimeId: string, guestType: "claude" | "codex"): void;
 
 	/** Detect the guest's display status by inspecting its output. */
 	getStatus(runtimeId: string): GuestStatus;
