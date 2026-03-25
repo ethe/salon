@@ -297,6 +297,7 @@ console.log("\n== 13. Resume summary formatting ==");
 		activeGuests: [{ name: "alice", type: "claude", runtimeId: "%1", workspaceDir: "/repo", sessionId: "s1", ready: true }],
 		suspendedGuests: [{ name: "bob", type: "codex", workspaceDir: "/repo", sessionId: "s2" }],
 		dismissedGuests: [{ name: "carol", type: "claude", workspaceDir: "/repo", sessionId: "s3" }],
+		resumeFailures: [{ name: "dave", reason: "tmux pane creation failed" }],
 		activeDiscussions: [{
 			topic: "direction-check",
 			stage: "debating",
@@ -312,6 +313,7 @@ console.log("\n== 13. Resume summary formatting ==");
 	assert("Summary includes suspended section", summary?.includes("Suspended guests (auto-paused when host exited, ready to resume):") === true);
 	assert("Summary includes dismissed section", summary?.includes("Dismissed guests:") === true);
 	assert("Summary includes discussion stage", summary?.includes("stage=debating") === true);
+	assert("Summary includes resume failure", summary?.includes("dave: tmux pane creation failed") === true);
 }
 
 

@@ -52,7 +52,7 @@ interface GuestRecord {
 	type: GuestType;
 	sessionId?: string;
 	nonce?: string;
-	startedAt: number;
+	startedAt?: number;
 	lifecycleStatus: GuestLifecycleStatus;
 	workspaceDir: string;
 	teardownReason?: GuestTeardownReason;
@@ -245,8 +245,8 @@ function git(args: string[], cwd: string): string | undefined {
 }
 
 
-function serializeStartedAt(startedAt: number): string {
-	return new Date(startedAt).toISOString();
+function serializeStartedAt(startedAt: number | undefined): string | undefined {
+	return startedAt !== undefined ? new Date(startedAt).toISOString() : undefined;
 }
 
 function parseStartedAt(value: string | undefined): number | undefined {
@@ -292,10 +292,14 @@ function readFirstLine(filePath: string): string | undefined {
 	}
 }
 
-function getCodexSessionDateDirs(startedAt: number): string[] {
+function getCodexSessionDateDirs(startedAt: number | undefined): string[] {
+	// When startedAt is unknown, use current time as a directory search heuristic.
+	// This doesn't affect candidate ranking (timestampDistanceMs stays Infinity)
+	// but allows nonce/cwd matching to still find the session.
+	const anchor = startedAt ?? Date.now();
 	const dirs = new Set<string>();
 	for (const dayOffset of [-1, 0, 1]) {
-		const date = new Date(startedAt);
+		const date = new Date(anchor);
 		date.setDate(date.getDate() + dayOffset);
 		const year = String(date.getFullYear());
 		const month = String(date.getMonth() + 1).padStart(2, "0");
@@ -325,12 +329,18 @@ interface CodexSessionScanCandidate {
 	timestampDistanceMs: number;
 }
 
+interface ResumeFailure {
+	name: string;
+	reason: string;
+}
+
 interface RecoveredSalonSummaryInput {
 	salonInstance: string;
 	workDir: string;
 	activeGuests: Array<Pick<Guest, "name" | "type" | "runtimeId" | "workspaceDir" | "sessionId" | "ready">>;
 	suspendedGuests: Array<Pick<GuestRecord, "name" | "type" | "workspaceDir" | "sessionId">>;
 	dismissedGuests: Array<Pick<GuestRecord, "name" | "type" | "workspaceDir" | "sessionId">>;
+	resumeFailures?: ResumeFailure[];
 	activeDiscussions: Array<{
 		topic: string;
 		stage: DiscussionStage;
@@ -362,10 +372,12 @@ function isBetterCodexSessionCandidate(
 }
 
 function formatRecoveredSalonSummary(input: RecoveredSalonSummaryInput): string | undefined {
+	const resumeFailures = input.resumeFailures || [];
 	if (
 		input.activeGuests.length === 0 &&
 		input.suspendedGuests.length === 0 &&
 		input.dismissedGuests.length === 0 &&
+		resumeFailures.length === 0 &&
 		input.activeDiscussions.length === 0 &&
 		input.archivedPendingDiscussions.length === 0
 	) {
@@ -397,6 +409,13 @@ function formatRecoveredSalonSummary(input: RecoveredSalonSummaryInput): string 
 		lines.push(`Dismissed guests:`);
 		for (const guest of input.dismissedGuests) {
 			lines.push(`- ${guest.name} (${guest.type}) workspace=${guest.workspaceDir} session=${guest.sessionId || "none"}`);
+		}
+	}
+
+	if (resumeFailures.length > 0) {
+		lines.push(`Failed to auto-resume:`);
+		for (const failure of resumeFailures) {
+			lines.push(`- ${failure.name}: ${failure.reason}`);
 		}
 	}
 
@@ -635,7 +654,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 						sessionId,
 						nonceMatched: Boolean(guest.nonce && baseInstructionsText?.includes(guest.nonce)),
 						cwdMatched: Boolean(payloadCwd && normalizePath(payloadCwd) === normalizedWorkDir),
-						timestampDistanceMs: Number.isFinite(timestampMs)
+						timestampDistanceMs: Number.isFinite(timestampMs) && guest.startedAt !== undefined
 							? Math.abs(timestampMs - guest.startedAt)
 							: Number.POSITIVE_INFINITY,
 					};
@@ -793,9 +812,8 @@ export default function salonExtension(pi: ExtensionAPI) {
 				sessionId: runtimeGuest?.sessionId || persistedGuest.sessionId,
 				nonce: runtimeGuest?.nonce || persistedGuest.nonce,
 				startedAt:
-					parseStartedAt(runtimeGuest?.startedAt) ||
-					parseStartedAt(persistedGuest.startedAt) ||
-					Date.now(),
+					parseStartedAt(runtimeGuest?.startedAt) ??
+					parseStartedAt(persistedGuest.startedAt),
 				// All guests become suspended on restore; resume via resume_guest / autoResume.
 				lifecycleStatus: persistedGuest.status === "dismissed" ? "dismissed" : "suspended",
 				workspaceDir: runtimeGuest?.workspaceDir || persistedGuest.workspaceDir || workDir,
@@ -941,13 +959,14 @@ export default function salonExtension(pi: ExtensionAPI) {
 		return handled;
 	}
 
-	function buildRecoveredSalonSummary(): string | undefined {
+	function buildRecoveredSalonSummary(resumeFailures: ResumeFailure[] = []): string | undefined {
 		return formatRecoveredSalonSummary({
 			salonInstance: SALON_INSTANCE,
 			workDir,
 			activeGuests: Array.from(guests.values()),
 			suspendedGuests: Array.from(dismissedGuests.values()).filter((guest) => guest.lifecycleStatus === "suspended"),
 			dismissedGuests: Array.from(dismissedGuests.values()).filter((guest) => guest.lifecycleStatus === "dismissed"),
+			resumeFailures,
 			activeDiscussions: Array.from(discussions.values()).map((discussion) => ({
 				topic: discussion.topic,
 				stage: discussion.stage,
@@ -1070,17 +1089,21 @@ export default function salonExtension(pi: ExtensionAPI) {
 		return guest;
 	}
 
-	function autoResumeAllSuspendedGuests() {
+	function autoResumeAllSuspendedGuests(): ResumeFailure[] {
+		const failures: ResumeFailure[] = [];
 		const suspended = Array.from(dismissedGuests.values()).filter(
 			(g) => g.lifecycleStatus === "suspended" && g.sessionId,
 		);
 		for (const guest of suspended) {
 			try {
 				resumeInactiveGuest(guest.name);
-			} catch {
-				// Leave as suspended if resume fails (e.g. tmux pane creation error)
+			} catch (error) {
+				// Leave as suspended; failure is reported in the recovery summary.
+				const reason = error instanceof Error ? error.message : String(error);
+				failures.push({ name: guest.name, reason });
 			}
 		}
+		return failures;
 	}
 
 	function cleanupDiscussion(discId: string, disc: Discussion) {
@@ -1618,8 +1641,8 @@ When these appear, process them thoughtfully — don't just echo them to the use
 		}
 		scheduleMissingCodexSessionScans();
 		if (restoredSnapshot) {
-			autoResumeAllSuspendedGuests();
-			pendingResumeSummary = buildRecoveredSalonSummary();
+			const resumeFailures = autoResumeAllSuspendedGuests();
+			pendingResumeSummary = buildRecoveredSalonSummary(resumeFailures);
 		}
 	}
 
