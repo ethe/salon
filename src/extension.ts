@@ -35,19 +35,24 @@ interface GuestRuntimeFile {
 	workspaceDir?: string;
 }
 
-interface GuestInfo {
+interface GuestRecord {
 	name: string;
 	type: GuestType;
-	paneId: string;
-	submitKey: string;
 	sessionId?: string;
 	nonce?: string;
 	startedAt: number;
-	status: GuestLifecycleStatus;
+	lifecycleStatus: GuestLifecycleStatus;
 	workspaceDir: string;
-	ready: boolean;
 	teardownReason?: GuestTeardownReason;
 }
+
+interface GuestRuntimeHandle {
+	runtimeId: string;
+	submitMode: string;
+	ready: boolean;
+}
+
+type Guest = GuestRecord & GuestRuntimeHandle;
 
 interface Deferred<T> {
 	promise: Promise<T>;
@@ -55,7 +60,7 @@ interface Deferred<T> {
 }
 
 // Guests that are not currently active but may still be resumable.
-const dismissedGuests = new Map<string, GuestInfo>();
+const dismissedGuests = new Map<string, GuestRecord>();
 
 // ── Discussion state machine ──────────────────────────────────────────
 type DiscussionStage = "exploring" | "debating" | "synthesizing" | "done";
@@ -106,7 +111,7 @@ interface SalonStateSnapshot {
 }
 
 
-const guests = new Map<string, GuestInfo>();
+const guests = new Map<string, Guest>();
 const discussions = new Map<string, Discussion>();
 const archivedDiscussions = new Map<string, Discussion>();
 // Track which guest belongs to which discussion
@@ -437,9 +442,9 @@ interface CodexSessionScanCandidate {
 interface RecoveredSalonSummaryInput {
 	salonInstance: string;
 	workDir: string;
-	activeGuests: Array<Pick<GuestInfo, "name" | "type" | "paneId" | "workspaceDir" | "sessionId" | "ready">>;
-	suspendedGuests: Array<Pick<GuestInfo, "name" | "type" | "workspaceDir" | "sessionId">>;
-	dismissedGuests: Array<Pick<GuestInfo, "name" | "type" | "workspaceDir" | "sessionId">>;
+	activeGuests: Array<Pick<Guest, "name" | "type" | "runtimeId" | "workspaceDir" | "sessionId" | "ready">>;
+	suspendedGuests: Array<Pick<GuestRecord, "name" | "type" | "workspaceDir" | "sessionId">>;
+	dismissedGuests: Array<Pick<GuestRecord, "name" | "type" | "workspaceDir" | "sessionId">>;
 	activeDiscussions: Array<{
 		topic: string;
 		stage: DiscussionStage;
@@ -548,7 +553,7 @@ function formatRecoveredSalonSummary(input: RecoveredSalonSummaryInput): string 
 		lines.push(`Active guests:`);
 		for (const guest of input.activeGuests) {
 			lines.push(
-				`- ${guest.name} (${guest.type}) pane=${guest.paneId} workspace=${guest.workspaceDir} session=${guest.sessionId || "none"} ready=${guest.ready ? "yes" : "no"}`,
+				`- ${guest.name} (${guest.type}) pane=${guest.runtimeId} workspace=${guest.workspaceDir} session=${guest.sessionId || "none"} ready=${guest.ready ? "yes" : "no"}`,
 			);
 		}
 	}
@@ -595,27 +600,27 @@ function inviteGuest(
 	workDir: string,
 	salonDir: string,
 	guestDir: string,
-): GuestInfo {
+): Guest {
 	name = sanitizeGuestName(name);
 	if (guests.has(name)) throw new Error(`Guest '${name}' is already in the salon`);
 
 	cancelCodexSessionScan(name);
 
-	const paneId = spawnPane(workDir);
-	if (!paneId) throw new Error("Failed to create tmux pane");
+	const runtimeId = spawnPane(workDir);
+	if (!runtimeId) throw new Error("Failed to create tmux pane");
 
-	const submitKey = submitKeyForGuestType(type);
+	const submitMode = submitKeyForGuestType(type);
 	const sessionId = type === "claude" ? randomUUID() : undefined;
 	const nonce = type === "codex" ? createCodexGuestNonce() : undefined;
-	const guest: GuestInfo = {
+	const guest: Guest = {
 		name,
 		type,
-		paneId,
-		submitKey,
+		runtimeId,
+		submitMode,
 		sessionId,
 		nonce,
 		startedAt: Date.now(),
-		status: "active",
+		lifecycleStatus: "active",
 		workspaceDir: workDir,
 		ready: false,
 	};
@@ -625,7 +630,7 @@ function inviteGuest(
 	writeFileSync(join(guestDir, `${name}.json`), JSON.stringify({
 		name: guest.name,
 		type: guest.type,
-		paneId: guest.paneId,
+		paneId: guest.runtimeId,
 		sessionId: guest.sessionId,
 		nonce: guest.nonce,
 		startedAt: serializeStartedAt(guest.startedAt),
@@ -667,7 +672,7 @@ function inviteGuest(
 	}));
 	chmodSync(wrapperScript, 0o755);
 
-	sendKeys(paneId, `exec bash ${shellQuote(wrapperScript)}`);
+	sendKeys(runtimeId, `exec bash ${shellQuote(wrapperScript)}`);
 
 	return guest;
 }
@@ -690,11 +695,11 @@ export default function salonExtension(pi: ExtensionAPI) {
 		return { sessionDir: hostSessionDir };
 	});
 
-	function writeGuestRuntimeFile(guest: GuestInfo) {
+	function writeGuestRuntimeFile(guest: Guest) {
 		const runtimeFile: GuestRuntimeFile = {
 			name: guest.name,
 			type: guest.type,
-			paneId: guest.paneId,
+			paneId: guest.runtimeId,
 			sessionId: guest.sessionId,
 			nonce: guest.nonce,
 			startedAt: serializeStartedAt(guest.startedAt),
@@ -727,11 +732,11 @@ export default function salonExtension(pi: ExtensionAPI) {
 		}
 	}
 
-	function serializeGuestInfo(guest: GuestInfo): PersistedGuestInfo {
+	function serializeGuestInfo(guest: GuestRecord): PersistedGuestInfo {
 		return {
 			name: guest.name,
 			type: guest.type,
-			status: guest.status,
+			status: guest.lifecycleStatus,
 			sessionId: guest.sessionId,
 			nonce: guest.nonce,
 			startedAt: serializeStartedAt(guest.startedAt),
@@ -749,14 +754,15 @@ export default function salonExtension(pi: ExtensionAPI) {
 		}
 	}
 
-	function claimGuestSessionId(guest: GuestInfo, sessionId: string) {
+	function claimGuestSessionId(guest: GuestRecord, sessionId: string) {
 		guest.sessionId = sessionId;
 		claimedSessionIds.add(sessionId);
-		writeGuestRuntimeFile(guest);
+		const activeGuest = guests.get(guest.name);
+		if (activeGuest) writeGuestRuntimeFile(activeGuest);
 		persistSalonState();
 	}
 
-	function ensureGuestExitWaiter(guest: GuestInfo): Promise<void> {
+	function ensureGuestExitWaiter(guest: Guest): Promise<void> {
 		const existing = guestExitWaiters.get(guest.name);
 		if (existing) return existing.promise;
 		const deferred = createDeferred<void>();
@@ -771,7 +777,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 		waiter.resolve(undefined);
 	}
 
-	function findCodexSessionCandidate(guest: GuestInfo, normalizedWorkDir: string): CodexSessionScanCandidate | undefined {
+	function findCodexSessionCandidate(guest: GuestRecord, normalizedWorkDir: string): CodexSessionScanCandidate | undefined {
 		let bestCandidate: CodexSessionScanCandidate | undefined;
 
 		for (const sessionsDir of getCodexSessionDateDirs(guest.startedAt)) {
@@ -821,7 +827,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 		return bestCandidate;
 	}
 
-	function scanCodexSessionId(guest: GuestInfo) {
+	function scanCodexSessionId(guest: GuestRecord) {
 		if (guest.type !== "codex" || guest.sessionId || activeCodexSessionScans.has(guest.name)) return;
 
 		const deadline = Date.now() + CODEX_SESSION_SCAN_TIMEOUT_MS;
@@ -960,36 +966,37 @@ export default function salonExtension(pi: ExtensionAPI) {
 
 		for (const persistedGuest of Object.values(snapshot.guests || {})) {
 			const runtimeGuest = readGuestRuntimeFile(persistedGuest.name);
-			const baseGuest: GuestInfo = {
+			const record: GuestRecord = {
 				name: persistedGuest.name,
 				type: persistedGuest.type,
-				paneId: "",
-				submitKey: submitKeyForGuestType(persistedGuest.type),
 				sessionId: runtimeGuest?.sessionId || persistedGuest.sessionId,
 				nonce: runtimeGuest?.nonce || persistedGuest.nonce,
 				startedAt:
 					parseStartedAt(runtimeGuest?.startedAt) ||
 					parseStartedAt(persistedGuest.startedAt) ||
 					Date.now(),
-				status: persistedGuest.status,
+				lifecycleStatus: persistedGuest.status,
 				workspaceDir: runtimeGuest?.workspaceDir || persistedGuest.workspaceDir || workDir,
-				ready: false,
 			};
 
 			if (persistedGuest.status === "dismissed" || persistedGuest.status === "suspended") {
-				dismissedGuests.set(baseGuest.name, baseGuest);
+				dismissedGuests.set(record.name, record);
 				continue;
 			}
 
 			if (runtimeGuest && livePanes.has(runtimeGuest.paneId)) {
-				baseGuest.paneId = runtimeGuest.paneId;
-				baseGuest.ready = true;
-				guests.set(baseGuest.name, baseGuest);
+				const guest: Guest = {
+					...record,
+					runtimeId: runtimeGuest.paneId,
+					submitMode: submitKeyForGuestType(record.type),
+					ready: true,
+				};
+				guests.set(guest.name, guest);
 				continue;
 			}
 
-			baseGuest.status = "suspended";
-			dismissedGuests.set(baseGuest.name, baseGuest);
+			record.lifecycleStatus = "suspended";
+			dismissedGuests.set(record.name, record);
 		}
 
 		for (const [id, persistedDiscussion] of Object.entries(snapshot.discussions || {})) {
@@ -1010,28 +1017,30 @@ export default function salonExtension(pi: ExtensionAPI) {
 		refreshClaimedSessionIds();
 	}
 
-	function getGuestDisplayStatus(guest: GuestInfo): string {
-		if (guest.status === "dismissing") return "dismissing";
+	function getGuestDisplayStatus(guest: Guest): string {
+		if (guest.lifecycleStatus === "dismissing") return "dismissing";
 		if (!guest.ready) return "starting";
-		return detectGuestStatus(guest.paneId);
+		return detectGuestStatus(guest.runtimeId);
 	}
 
-	function resolveInactiveGuestStatus(guest: GuestInfo): "suspended" | "dismissed" {
-		if (guest.status === "suspended" || guest.status === "dismissed") return guest.status;
+	function resolveInactiveGuestStatus(guest: Guest): "suspended" | "dismissed" {
+		if (guest.lifecycleStatus === "suspended" || guest.lifecycleStatus === "dismissed") return guest.lifecycleStatus;
 		return guest.teardownReason === "host" ? "suspended" : "dismissed";
 	}
 
-	function buildInactiveGuestRecord(guest: GuestInfo): GuestInfo {
+	function buildInactiveGuestRecord(guest: Guest): GuestRecord {
 		return {
-			...guest,
-			status: resolveInactiveGuestStatus(guest),
-			ready: false,
-			submitKey: submitKeyForGuestType(guest.type),
-			teardownReason: undefined,
+			name: guest.name,
+			type: guest.type,
+			sessionId: guest.sessionId,
+			nonce: guest.nonce,
+			startedAt: guest.startedAt,
+			lifecycleStatus: resolveInactiveGuestStatus(guest),
+			workspaceDir: guest.workspaceDir,
 		};
 	}
 
-	function captureFinalCodexSessionId(guest: GuestInfo) {
+	function captureFinalCodexSessionId(guest: Guest) {
 		if (guest.type === "codex" && !guest.sessionId) {
 			const candidate = findCodexSessionCandidate(guest, normalizePath(guest.workspaceDir));
 			if (candidate) {
@@ -1063,27 +1072,27 @@ export default function salonExtension(pi: ExtensionAPI) {
 		}
 	}
 
-	function beginGuestDismissal(guest: GuestInfo, teardownReason: GuestTeardownReason): Promise<void> {
+	function beginGuestDismissal(guest: Guest, teardownReason: GuestTeardownReason): Promise<void> {
 		const waitForExit = ensureGuestExitWaiter(guest);
-		if (guest.status === "dismissing") {
+		if (guest.lifecycleStatus === "dismissing") {
 			guest.teardownReason = guest.teardownReason || teardownReason;
 			return waitForExit;
 		}
 		guest.teardownReason = teardownReason;
 		captureFinalCodexSessionId(guest);
-		guest.status = "dismissing";
+		guest.lifecycleStatus = "dismissing";
 		removeGuestFromDiscussion(guest.name);
 		writeGuestRuntimeFile(guest);
 		persistSalonState();
 		// Interrupt first, then exit the shell explicitly so the wrapper can report the final session id.
-		tmux(["send-keys", "-t", guest.paneId, "C-c"]);
-		tmux(["send-keys", "-t", guest.paneId, "C-c"]);
-		tmux(["send-keys", "-t", guest.paneId, "-l", "exit"]);
-		tmux(["send-keys", "-t", guest.paneId, "Enter"]);
+		tmux(["send-keys", "-t", guest.runtimeId, "C-c"]);
+		tmux(["send-keys", "-t", guest.runtimeId, "C-c"]);
+		tmux(["send-keys", "-t", guest.runtimeId, "-l", "exit"]);
+		tmux(["send-keys", "-t", guest.runtimeId, "Enter"]);
 		return waitForExit;
 	}
 
-	function flushQueuedGuestMessages(guest: GuestInfo) {
+	function flushQueuedGuestMessages(guest: Guest) {
 		const queued = queuedGuestMessages.get(guest.name);
 		if (!queued?.length) return;
 		queuedGuestMessages.delete(guest.name);
@@ -1092,7 +1101,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 		}
 	}
 
-	function sayToGuest(guest: GuestInfo, message: string, from = "host") {
+	function sayToGuest(guest: Guest, message: string, from = "host") {
 		if (!guest.ready) {
 			const queued = queuedGuestMessages.get(guest.name) || [];
 			queued.push({ message, from });
@@ -1102,14 +1111,14 @@ export default function salonExtension(pi: ExtensionAPI) {
 
 		const prefix = `[${from}]: `;
 		if (message.length <= MSG_LENGTH_THRESHOLD) {
-			sendKeys(guest.paneId, `${prefix}${message}`, guest.submitKey);
+			sendKeys(guest.runtimeId, `${prefix}${message}`, guest.submitMode);
 		} else {
 			// Long messages: write to file, send short reference via send-keys
 			const exchangeDir = join(salonDir, "exchange");
 			mkdirSync(exchangeDir, { recursive: true });
 			const msgFile = join(exchangeDir, `${++msgFileCounter}_${safeLabelForFilename(from)}.md`);
 			writeFileSync(msgFile, message);
-			sendKeys(guest.paneId, `${prefix}Read ${msgFile} and respond.`, guest.submitKey);
+			sendKeys(guest.runtimeId, `${prefix}Read ${msgFile} and respond.`, guest.submitMode);
 		}
 	}
 
@@ -1205,8 +1214,8 @@ export default function salonExtension(pi: ExtensionAPI) {
 			salonInstance: SALON_INSTANCE,
 			workDir,
 			activeGuests: Array.from(guests.values()),
-			suspendedGuests: Array.from(dismissedGuests.values()).filter((guest) => guest.status === "suspended"),
-			dismissedGuests: Array.from(dismissedGuests.values()).filter((guest) => guest.status === "dismissed"),
+			suspendedGuests: Array.from(dismissedGuests.values()).filter((guest) => guest.lifecycleStatus === "suspended"),
+			dismissedGuests: Array.from(dismissedGuests.values()).filter((guest) => guest.lifecycleStatus === "dismissed"),
 			activeDiscussions: Array.from(discussions.values()).map((discussion) => ({
 				topic: discussion.topic,
 				stage: discussion.stage,
@@ -1227,7 +1236,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 		});
 	}
 
-	function resumeInactiveGuest(name: string): GuestInfo {
+	function resumeInactiveGuest(name: string): Guest {
 		name = sanitizeGuestName(name);
 		const dismissed = dismissedGuests.get(name);
 		if (!dismissed) {
@@ -1243,18 +1252,18 @@ export default function salonExtension(pi: ExtensionAPI) {
 
 		cancelCodexSessionScan(name);
 		const resumeWorkDir = dismissed.workspaceDir || workDir;
-		const paneId = spawnPane(resumeWorkDir);
-		if (!paneId) throw new Error("Failed to create tmux pane");
+		const runtimeId = spawnPane(resumeWorkDir);
+		if (!runtimeId) throw new Error("Failed to create tmux pane");
 
-		const guest: GuestInfo = {
+		const guest: Guest = {
 			name: dismissed.name,
 			type: dismissed.type,
-			paneId,
-			submitKey: submitKeyForGuestType(dismissed.type),
+			runtimeId,
+			submitMode: submitKeyForGuestType(dismissed.type),
 			sessionId: dismissed.sessionId,
 			nonce: dismissed.nonce,
 			startedAt: Date.now(),
-			status: "active",
+			lifecycleStatus: "active",
 			workspaceDir: resumeWorkDir,
 			ready: false,
 		};
@@ -1298,7 +1307,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 		}));
 		chmodSync(wrapperScript, 0o755);
 
-		sendKeys(paneId, `exec bash ${shellQuote(wrapperScript)}`);
+		sendKeys(runtimeId, `exec bash ${shellQuote(wrapperScript)}`);
 		reactivateArchivedDiscussions();
 		persistSalonState();
 		return guest;
@@ -1306,7 +1315,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 
 	function autoResumeAllSuspendedGuests() {
 		const suspended = Array.from(dismissedGuests.values()).filter(
-			(g) => g.status === "suspended" && g.sessionId,
+			(g) => g.lifecycleStatus === "suspended" && g.sessionId,
 		);
 		for (const guest of suspended) {
 			try {
@@ -1580,7 +1589,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 		async execute(_id, params: any) {
 			const guest = guests.get(params.name);
 			if (!guest) throw new Error(`Guest '${params.name}' is not in the salon`);
-			if (guest.status !== "active") throw new Error(`Guest '${params.name}' is not accepting new messages right now.`);
+			if (guest.lifecycleStatus !== "active") throw new Error(`Guest '${params.name}' is not accepting new messages right now.`);
 			sayToGuest(guest, params.message);
 			return {
 				content: [{ type: "text" as const, text: `Said to '${params.name}'.` }],
@@ -1619,7 +1628,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 		async execute(_id, params: any) {
 			const guest = guests.get(params.name);
 			if (!guest) throw new Error(`Guest '${params.name}' is not in the salon`);
-			if (guest.status === "dismissing") {
+			if (guest.lifecycleStatus === "dismissing") {
 				return { content: [{ type: "text" as const, text: `Guest '${params.name}' is already being dismissed.` }], details: {} };
 			}
 			beginGuestDismissal(guest, "user");
@@ -1654,7 +1663,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 		promptSnippet: "Resume all suspended guests",
 		parameters: Type.Object({}),
 		async execute() {
-			const suspendedGuests = Array.from(dismissedGuests.values()).filter((guest) => guest.status === "suspended");
+			const suspendedGuests = Array.from(dismissedGuests.values()).filter((guest) => guest.lifecycleStatus === "suspended");
 			if (suspendedGuests.length === 0) {
 				return { content: [{ type: "text" as const, text: "No suspended guests are waiting to be resumed." }], details: {} };
 			}
@@ -1812,8 +1821,8 @@ When these appear, process them thoughtfully — don't just echo them to the use
 			lines.push(`  ${g.name} (${g.type}): ${status}${discLabel}`);
 		}
 		for (const g of dismissedGuests.values()) {
-			if (g.status !== "suspended") continue;
-			lines.push(`  ${g.name} (${g.type}): ${g.status}${g.sessionId ? " (session saved)" : ""}`);
+			if (g.lifecycleStatus !== "suspended") continue;
+			lines.push(`  ${g.name} (${g.type}): ${g.lifecycleStatus}${g.sessionId ? " (session saved)" : ""}`);
 		}
 
 		if (lines.length === 0) return { action: "continue" as const };
@@ -1882,29 +1891,40 @@ When these appear, process them thoughtfully — don't just echo them to the use
 				const parts = msg.content.slice("guest_exited:".length).split(":");
 				const name = parts[0];
 				const sessionId = parts[1] || undefined;
-				const guest = guests.get(name) || dismissedGuests.get(name);
-				if (guest) {
+				const activeGuest = guests.get(name);
+				const inactiveRecord = dismissedGuests.get(name);
+				if (activeGuest) {
 					cancelCodexSessionScan(name);
-					if (!guest.sessionId && sessionId) {
-						guest.sessionId = sessionId;
+					if (!activeGuest.sessionId && sessionId) {
+						activeGuest.sessionId = sessionId;
 					}
-					if (guest.sessionId) {
-						claimedSessionIds.add(guest.sessionId);
+					if (activeGuest.sessionId) {
+						claimedSessionIds.add(activeGuest.sessionId);
 					}
 					const droppedQueuedCount = queuedGuestMessages.get(name)?.length || 0;
-					const inactiveGuest = buildInactiveGuestRecord(guest);
+					writeGuestRuntimeFile(activeGuest);
+					const inactiveGuest = buildInactiveGuestRecord(activeGuest);
 					guests.delete(name);
 					dismissedGuests.set(name, inactiveGuest);
 					queuedGuestMessages.delete(name);
 					removeGuestFromDiscussion(name);
-					writeGuestRuntimeFile(inactiveGuest);
 					persistSalonState();
 					settleGuestExitWaiter(name);
 					equalizeGuestPanes();
 					const resumeHint = inactiveGuest.sessionId ? ` Session saved — use resume_guest to bring them back.` : "";
 					const queueHint = droppedQueuedCount > 0 ? ` ${droppedQueuedCount} queued message(s) were never delivered.` : "";
-					const exitLabel = inactiveGuest.status === "suspended" ? "has been suspended" : "has left the salon";
+					const exitLabel = inactiveGuest.lifecycleStatus === "suspended" ? "has been suspended" : "has left the salon";
 					pi.sendUserMessage(`[salon] Guest '${name}' ${exitLabel}.${resumeHint}${queueHint}`, { deliverAs: "followUp" });
+				} else if (inactiveRecord) {
+					cancelCodexSessionScan(name);
+					if (!inactiveRecord.sessionId && sessionId) {
+						inactiveRecord.sessionId = sessionId;
+					}
+					if (inactiveRecord.sessionId) {
+						claimedSessionIds.add(inactiveRecord.sessionId);
+					}
+					persistSalonState();
+					settleGuestExitWaiter(name);
 				}
 				return;
 			}
@@ -1919,9 +1939,9 @@ When these appear, process them thoughtfully — don't just echo them to the use
 	async function teardownSalonSession(options: { killTmuxSession: boolean }) {
 		const exitWaits: Promise<void>[] = [];
 		for (const guest of guests.values()) {
-			if (guest.status === "active") {
+			if (guest.lifecycleStatus === "active") {
 				exitWaits.push(beginGuestDismissal(guest, "host"));
-			} else if (guest.status === "dismissing") {
+			} else if (guest.lifecycleStatus === "dismissing") {
 				guest.teardownReason = guest.teardownReason || "host";
 				exitWaits.push(ensureGuestExitWaiter(guest));
 			}
@@ -1933,13 +1953,12 @@ When these appear, process them thoughtfully — don't just echo them to the use
 		]);
 
 		for (const [name, guest] of Array.from(guests.entries())) {
-			if (guest.status !== "dismissing") continue;
+			if (guest.lifecycleStatus !== "dismissing") continue;
 			settleGuestExitWaiter(name);
-			if (!guest.sessionId) continue;
+			if (guest.sessionId) writeGuestRuntimeFile(guest);
 			guests.delete(name);
 			const inactiveGuest = buildInactiveGuestRecord(guest);
 			dismissedGuests.set(name, inactiveGuest);
-			writeGuestRuntimeFile(inactiveGuest);
 		}
 		persistSalonState();
 
@@ -1996,9 +2015,9 @@ When these appear, process them thoughtfully — don't just echo them to the use
 		description: "Jump to the next guest waiting for input (approval)",
 		handler: async (_args, ctx) => {
 			for (const [, guest] of guests) {
-				if (guest.status !== "active") continue;
-				if (detectGuestStatus(guest.paneId) === "input") {
-					tmux(["select-pane", "-t", guest.paneId]);
+				if (guest.lifecycleStatus !== "active") continue;
+				if (detectGuestStatus(guest.runtimeId) === "input") {
+					tmux(["select-pane", "-t", guest.runtimeId]);
 					ctx.ui.notify(`Switched to ${guest.name} (needs input)`, "info");
 					return;
 				}

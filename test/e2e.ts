@@ -265,7 +265,7 @@ console.log("\n== 12. Resume summary formatting ==");
 	const summary = extensionTest.formatRecoveredSalonSummary({
 		salonInstance: "test-instance",
 		workDir: "/repo",
-		activeGuests: [{ name: "alice", type: "claude", paneId: "%1", workspaceDir: "/repo", sessionId: "s1", ready: true }],
+		activeGuests: [{ name: "alice", type: "claude", runtimeId: "%1", workspaceDir: "/repo", sessionId: "s1", ready: true }],
 		suspendedGuests: [{ name: "bob", type: "codex", workspaceDir: "/repo", sessionId: "s2" }],
 		dismissedGuests: [{ name: "carol", type: "claude", workspaceDir: "/repo", sessionId: "s3" }],
 		activeDiscussions: [{
