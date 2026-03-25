@@ -7,12 +7,11 @@
  * Run: pi --extension ./src/extension.ts
  */
 
-import { DynamicBorder, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Container, type SelectItem, SelectList, Text } from "@mariozechner/pi-tui";
+import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, realpathSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { createServer, type Server } from "node:net";
@@ -106,15 +105,6 @@ interface SalonStateSnapshot {
 	updatedAt: string;
 }
 
-interface SalonSessionInfo {
-	path: string;
-	id: string;
-	timestamp: string;
-	name?: string;
-	guestCount: number;
-	discussionCount: number;
-	modified: Date;
-}
 
 const guests = new Map<string, GuestInfo>();
 const discussions = new Map<string, Discussion>();
@@ -901,6 +891,16 @@ export default function salonExtension(pi: ExtensionAPI) {
 
 	function persistSalonState() {
 		pi.appendEntry<SalonStateSnapshot>(SALON_STATE_ENTRY_TYPE, buildSalonStateSnapshot());
+		updateSessionName();
+	}
+
+	function updateSessionName() {
+		const guestCount = guests.size + dismissedGuests.size;
+		const discCount = discussions.size;
+		const parts: string[] = [];
+		if (guestCount > 0) parts.push(`${guestCount} guest${guestCount > 1 ? "s" : ""}`);
+		if (discCount > 0) parts.push(`${discCount} discussion${discCount > 1 ? "s" : ""}`);
+		pi.setSessionName(parts.length > 0 ? `salon: ${parts.join(" · ")}` : "salon");
 	}
 
 	function clearRuntimeState() {
@@ -946,96 +946,6 @@ export default function salonExtension(pi: ExtensionAPI) {
 			snapshot.guests !== null &&
 			typeof snapshot.discussions === "object" &&
 			snapshot.discussions !== null;
-	}
-
-	function listSalonSessions(hostSessionDir: string): SalonSessionInfo[] {
-		if (!existsSync(hostSessionDir)) return [];
-
-		const sessions: SalonSessionInfo[] = [];
-		for (const fileName of readdirSync(hostSessionDir)) {
-			if (!fileName.endsWith(".jsonl")) continue;
-
-			const sessionPath = join(hostSessionDir, fileName);
-
-			try {
-				const content = readFileSync(sessionPath, "utf8");
-				const lines = content.split("\n").filter((line) => line.trim().length > 0);
-				if (lines.length === 0) continue;
-
-				const header = JSON.parse(lines[0]!) as { type?: string; id?: string; timestamp?: string };
-				if (header.type !== "session" || typeof header.id !== "string" || typeof header.timestamp !== "string") {
-					continue;
-				}
-
-				let name: string | undefined;
-				let guestCount = 0;
-				let discussionCount = 0;
-				let foundName = false;
-				let foundSalonState = false;
-
-				for (let i = lines.length - 1; i >= 1; i--) {
-					const line = lines[i];
-					if (!line) continue;
-
-					let entry: { type?: string; name?: string; customType?: string; data?: unknown } | undefined;
-					try {
-						entry = JSON.parse(line) as { type?: string; name?: string; customType?: string; data?: unknown };
-					} catch {
-						continue;
-					}
-
-					if (!foundName && entry.type === "session_info" && typeof entry.name === "string") {
-						const trimmedName = entry.name.trim();
-						if (trimmedName) {
-							name = trimmedName;
-							foundName = true;
-						}
-					}
-
-					if (
-						!foundSalonState &&
-						entry.type === "custom" &&
-						entry.customType === SALON_STATE_ENTRY_TYPE &&
-						isSalonStateSnapshot(entry.data)
-					) {
-						guestCount = Object.keys(entry.data.guests).length;
-						discussionCount = Object.keys(entry.data.discussions).length;
-						foundSalonState = true;
-					}
-
-					if (foundName && foundSalonState) break;
-				}
-
-				sessions.push({
-					path: sessionPath,
-					id: header.id,
-					timestamp: header.timestamp,
-					name,
-					guestCount,
-					discussionCount,
-					modified: statSync(sessionPath).mtime,
-				});
-			} catch {
-				continue;
-			}
-		}
-
-		sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
-		return sessions;
-	}
-
-	function formatSessionLabel(timestamp: string, name?: string): string {
-		const parsed = new Date(timestamp);
-		if (Number.isNaN(parsed.getTime())) {
-			return `${timestamp}  ${name || "(unnamed)"}`;
-		}
-
-		const year = parsed.getFullYear();
-		const month = String(parsed.getMonth() + 1).padStart(2, "0");
-		const day = String(parsed.getDate()).padStart(2, "0");
-		const hours = String(parsed.getHours()).padStart(2, "0");
-		const minutes = String(parsed.getMinutes()).padStart(2, "0");
-		return `${year}-${month}-${day} ${hours}:${minutes}  ${name || "(unnamed)"}`;
 	}
 
 	function restoreSalonState(snapshot: SalonStateSnapshot) {
@@ -1481,7 +1391,6 @@ export default function salonExtension(pi: ExtensionAPI) {
 			discussions.set(discId, disc);
 			guestToDiscussion.set(nameA, discId);
 			guestToDiscussion.set(nameB, discId);
-			pi.setSessionName(`salon: ${params.topic}`);
 			persistSalonState();
 
 				// Messages are queued until each guest reports ready.
@@ -2029,62 +1938,6 @@ When these appear, process them thoughtfully — don't just echo them to the use
 				return `${g.name} (${g.type}) ${status}${discLabel} @ ${g.workspaceDir}`;
 			});
 			ctx.ui.notify(lines.join("\n"), "info");
-		},
-	});
-
-	pi.registerCommand("resume", {
-		description: "Resume a previous salon session",
-		handler: async (_args, ctx) => {
-			if (!ctx.hasUI) {
-				throw new Error("/resume requires an interactive UI session.");
-			}
-
-			const currentSessionFile = ctx.sessionManager.getSessionFile();
-			const currentSessionPath = currentSessionFile ? resolve(currentSessionFile) : undefined;
-			const sessions = listSalonSessions(hostSessionDir).filter((session) => resolve(session.path) !== currentSessionPath);
-
-			if (sessions.length === 0) {
-				ctx.ui.notify("No other salon sessions found.", "info");
-				return;
-			}
-
-			const items: SelectItem[] = sessions.map((session) => ({
-				value: session.path,
-				label: formatSessionLabel(session.timestamp, session.name),
-				description: `${session.guestCount} guests · ${session.discussionCount} discussions`,
-			}));
-
-			const selectedPath = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
-				const container = new Container();
-				container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
-				container.addChild(new Text(theme.fg("accent", theme.bold("Resume Salon Session")), 1, 0));
-
-				const selectList = new SelectList(items, Math.min(items.length, 10), {
-					selectedPrefix: (text) => theme.fg("accent", text),
-					selectedText: (text) => theme.fg("accent", text),
-					description: (text) => theme.fg("muted", text),
-					scrollInfo: (text) => theme.fg("dim", text),
-					noMatch: (text) => theme.fg("warning", text),
-				});
-				selectList.onSelect = (item) => done(item.value);
-				selectList.onCancel = () => done(null);
-				container.addChild(selectList);
-
-				container.addChild(new Text(theme.fg("dim", "↑↓ navigate • enter resume • esc cancel"), 1, 0));
-				container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
-
-				return {
-					render: (width) => container.render(width),
-					invalidate: () => container.invalidate(),
-					handleInput: (data) => {
-						selectList.handleInput(data);
-						tui.requestRender();
-					},
-				};
-			});
-
-			if (!selectedPath) return;
-			await ctx.switchSession(selectedPath);
 		},
 	});
 
