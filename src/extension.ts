@@ -680,9 +680,11 @@ export default function salonExtension(pi: ExtensionAPI) {
 	function trackGuestSessionId(
 		guest: GuestRecord,
 		sessionId: string | undefined,
-		options: { persist?: boolean; writeRuntimeFile?: boolean } = {},
+		options: { persist?: boolean; writeRuntimeFile?: boolean; force?: boolean } = {},
 	): string | undefined {
-		const trackedSessionId = guest.sessionId || sessionId;
+		// force: incoming sessionId overwrites existing (used by guest_exited which is authoritative).
+		// default: keep existing sessionId if present (used by scan results which are heuristic).
+		const trackedSessionId = options.force && sessionId ? sessionId : (guest.sessionId || sessionId);
 		if (!trackedSessionId) return undefined;
 		guest.sessionId = trackedSessionId;
 		claimedSessionIds.add(trackedSessionId);
@@ -734,12 +736,9 @@ export default function salonExtension(pi: ExtensionAPI) {
 			return false;
 		}
 		guest.teardownReason = teardownReason;
-		if (guest.type === "codex" && !guest.sessionId) {
-			const candidate = findCodexSessionCandidate(guest, normalizePath(guest.workspaceDir));
-			if (candidate) {
-				trackGuestSessionId(guest, candidate.sessionId, { writeRuntimeFile: false });
-			}
-		}
+		// Don't do a last-chance synchronous scan here — it races with guest_exited
+		// which provides the authoritative session ID. Let guest_exited (or the
+		// teardown-timeout path in transitionGuestToInactive) handle it.
 		cancelCodexSessionScan(guest.name);
 		guest.lifecycleStatus = "dismissing";
 		removeGuestFromDiscussion(guest.name);
@@ -759,7 +758,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 		const activeGuest = guests.get(name);
 		if (activeGuest) {
 			cancelCodexSessionScan(name);
-			trackGuestSessionId(activeGuest, sessionId, { writeRuntimeFile: false });
+			trackGuestSessionId(activeGuest, sessionId, { writeRuntimeFile: false, force: !!sessionId });
 			const droppedQueuedCount = queuedGuestMessages.get(name)?.length || 0;
 			if (runtimeFileMode === "always" || activeGuest.sessionId) {
 				writeGuestRuntimeFile(activeGuest);
@@ -783,7 +782,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 			return { transitionedFromActive: false, droppedQueuedCount: 0 };
 		}
 		cancelCodexSessionScan(name);
-		trackGuestSessionId(inactiveRecord, sessionId, { writeRuntimeFile: false });
+		trackGuestSessionId(inactiveRecord, sessionId, { writeRuntimeFile: false, force: !!sessionId });
 		if (persist) {
 			persistSalonState();
 		}
@@ -840,6 +839,12 @@ export default function salonExtension(pi: ExtensionAPI) {
 			}
 		}
 
+		// If the guest has a nonce but no candidate matched it, don't fall back to
+		// weaker signals (cwd/timestamp) — they can cross-match the wrong session
+		// when multiple Codex guests share the same workDir.
+		if (guest.nonce && bestCandidate && !bestCandidate.nonceMatched) {
+			return undefined;
+		}
 		return bestCandidate;
 	}
 
