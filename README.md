@@ -13,7 +13,7 @@ Two concrete use cases:
 
 ## How it works
 
-Salon is a [pi](https://github.com/badlogic/pi-mono) extension. The host runs as a pi instance with salon tools; guests are standard Claude Code or Codex CLI processes in tmux panes.
+Salon is a [pi](https://github.com/badlogic/pi-mono) extension. The host runs as a pi instance with salon tools; guests are standard Claude Code or Codex CLI processes in tmux panes. For detailed internal architecture, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ```
 ┌──────────────────────┬──────────────────────┐
@@ -65,14 +65,13 @@ Cross-review messages use the other guest's name as prefix (`[alice]:`, `[bob]:`
 
 - **Spawn**: `exec` replaces the shell process — when the agent exits, the tmux pane closes automatically.
 - **Ready signal**: guests queue incoming messages until their wrapper reports `guest_ready` over the salon socket, so startup no longer depends on a fixed sleep.
-- **Status detection**: `tmux capture-pane` inspects the TUI status bar to determine if a guest is working, waiting for input (approval), idle, or new. (Inspired by [gavraz/recon](https://github.com/gavraz/recon).)
+- **Status detection**: `tmux capture-pane` inspects the TUI status bar to determine if a guest is working, waiting for input (approval), or idle. (Inspired by [gavraz/recon](https://github.com/gavraz/recon).)
 - **Exit tracking**: the guest wrapper reports `guest_exited:<name>:<sessionId>` over the salon socket when the agent process terminates. The host automatically deregisters the guest and keeps its session/workspace metadata for resume.
-- **Workspace isolation**: Codex guests run in isolated git worktrees under `SALON_DIR/worktrees/<guest>` when the working directory is inside a git repo, so parallel execution does not trample the primary checkout.
 
 ### Session continuity
 
 - **Host resume**: salon stores structured runtime state via `pi.appendEntry()` in a salon-specific host session directory and restores it on `pi --continue`.
-- **Guest resume**: dismissed guests keep their session IDs and isolated workspace paths. `resume_guest` relaunches the original Claude/Codex session when possible.
+- **Guest resume**: dismissed guests keep their session IDs and workspace paths. `resume_guest` relaunches the original Claude/Codex session when possible.
 - **Recovered state injection**: after resume, the host receives a structured summary of recovered guests and discussions in its system prompt so it does not lose the salon's discussion state.
 - **Session switching**: `/new` and `/resume` now dismiss active guests, persist the current salon state, and restore the target salon session after the switch.
 
@@ -116,7 +115,6 @@ Optional environment variables:
 - `SALON_INSTANCE` — override the derived salon instance ID
 - `SALON_TMUX_SESSION` — override the tmux session name
 - `SALON_DIR` — override the state/runtime directory
-- `SALON_WORKSPACE_MODE=shared` — disable isolated worktrees and run all guests in the main checkout
 
 ## Project structure
 
@@ -127,7 +125,8 @@ src/
 hooks/
   agent-response.sh   Unified hook for Claude Code (stdin) and Codex CLI ($1 arg)
 test/
-  e2e.ts          End-to-end tests: hook IPC, tmux pane management, send-keys, ready wrapper, worktree isolation helpers
+  e2e.ts          End-to-end tests: hook IPC, tmux pane management, send-keys, ready wrapper
+ARCHITECTURE.md   Internal architecture documentation for contributors
 ```
 
 ## External configuration
