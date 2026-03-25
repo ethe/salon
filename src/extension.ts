@@ -525,8 +525,6 @@ function inviteGuest(
 	name = sanitizeGuestName(name);
 	if (guests.has(name)) throw new Error(`Guest '${name}' is already in the salon`);
 
-	cancelCodexSessionScan(name);
-
 	const sessionId = type === "claude" ? randomUUID() : undefined;
 	const nonce = type === "codex" ? createCodexGuestNonce() : undefined;
 
@@ -571,19 +569,6 @@ function inviteGuest(
 		workspaceDir: workDir,
 		ready: false,
 	};
-	guests.set(name, guest);
-	if (guest.sessionId) claimedSessionIds.add(guest.sessionId);
-	queuedGuestMessages.delete(name);
-	writeFileSync(join(guestDir, `${name}.json`), JSON.stringify({
-		name: guest.name,
-		type: guest.type,
-		paneId: guest.runtimeId,
-		sessionId: guest.sessionId,
-		nonce: guest.nonce,
-		startedAt: serializeStartedAt(guest.startedAt),
-		workspaceDir: guest.workspaceDir,
-	} satisfies GuestRuntimeFile, null, 2));
-
 	return guest;
 }
 
@@ -672,11 +657,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 	}
 
 	function claimGuestSessionId(guest: GuestRecord, sessionId: string) {
-		guest.sessionId = sessionId;
-		claimedSessionIds.add(sessionId);
-		const activeGuest = guests.get(guest.name);
-		if (activeGuest) writeGuestRuntimeFile(activeGuest);
-		persistSalonState();
+		trackGuestSessionId(guest, sessionId, { persist: true });
 	}
 
 	function ensureGuestExitWaiter(guest: Guest): Promise<void> {
@@ -692,6 +673,124 @@ export default function salonExtension(pi: ExtensionAPI) {
 		if (!waiter) return;
 		guestExitWaiters.delete(name);
 		waiter.resolve(undefined);
+	}
+
+	type GuestRuntimeFileMode = "always" | "ifSessionTracked";
+
+	function trackGuestSessionId(
+		guest: GuestRecord,
+		sessionId: string | undefined,
+		options: { persist?: boolean; writeRuntimeFile?: boolean } = {},
+	): string | undefined {
+		const trackedSessionId = guest.sessionId || sessionId;
+		if (!trackedSessionId) return undefined;
+		guest.sessionId = trackedSessionId;
+		claimedSessionIds.add(trackedSessionId);
+		const activeGuest = guests.get(guest.name);
+		if (options.writeRuntimeFile !== false && activeGuest) {
+			writeGuestRuntimeFile(activeGuest);
+		}
+		if (options.persist) {
+			persistSalonState();
+		}
+		return trackedSessionId;
+	}
+
+	function activateGuestLifecycle(
+		guest: Guest,
+		options: { dropDismissedRecord?: boolean; reactivateArchivedDiscussions?: boolean; persist?: boolean } = {},
+	): Guest {
+		cancelCodexSessionScan(guest.name);
+		guests.set(guest.name, guest);
+		if (options.dropDismissedRecord) {
+			dismissedGuests.delete(guest.name);
+		}
+		if (guest.sessionId) {
+			claimedSessionIds.add(guest.sessionId);
+		}
+		queuedGuestMessages.delete(guest.name);
+		writeGuestRuntimeFile(guest);
+		if (options.reactivateArchivedDiscussions) {
+			reactivateArchivedDiscussions();
+		}
+		if (options.persist) {
+			persistSalonState();
+		}
+		return guest;
+	}
+
+	function markGuestReady(name: string): Guest | undefined {
+		const guest = guests.get(name);
+		if (!guest || guest.ready) return guest;
+		guest.ready = true;
+		writeGuestRuntimeFile(guest);
+		flushQueuedGuestMessages(guest);
+		return guest;
+	}
+
+	function transitionGuestToDismissing(guest: Guest, teardownReason: GuestTeardownReason): boolean {
+		if (guest.lifecycleStatus === "dismissing") {
+			guest.teardownReason = guest.teardownReason || teardownReason;
+			return false;
+		}
+		guest.teardownReason = teardownReason;
+		if (guest.type === "codex" && !guest.sessionId) {
+			const candidate = findCodexSessionCandidate(guest, normalizePath(guest.workspaceDir));
+			if (candidate) {
+				trackGuestSessionId(guest, candidate.sessionId, { writeRuntimeFile: false });
+			}
+		}
+		cancelCodexSessionScan(guest.name);
+		guest.lifecycleStatus = "dismissing";
+		removeGuestFromDiscussion(guest.name);
+		writeGuestRuntimeFile(guest);
+		persistSalonState();
+		return true;
+	}
+
+	function transitionGuestToInactive(
+		name: string,
+		sessionId: string | undefined,
+		options: { persist?: boolean; settleWaiter?: boolean; runtimeFileMode?: GuestRuntimeFileMode } = {},
+	): { inactiveGuest?: GuestRecord; transitionedFromActive: boolean; droppedQueuedCount: number } {
+		const persist = options.persist ?? true;
+		const settleWaiter = options.settleWaiter ?? true;
+		const runtimeFileMode = options.runtimeFileMode || "always";
+		const activeGuest = guests.get(name);
+		if (activeGuest) {
+			cancelCodexSessionScan(name);
+			trackGuestSessionId(activeGuest, sessionId, { writeRuntimeFile: false });
+			const droppedQueuedCount = queuedGuestMessages.get(name)?.length || 0;
+			if (runtimeFileMode === "always" || activeGuest.sessionId) {
+				writeGuestRuntimeFile(activeGuest);
+			}
+			const inactiveGuest = buildInactiveGuestRecord(activeGuest);
+			guests.delete(name);
+			dismissedGuests.set(name, inactiveGuest);
+			queuedGuestMessages.delete(name);
+			removeGuestFromDiscussion(name);
+			if (persist) {
+				persistSalonState();
+			}
+			if (settleWaiter) {
+				settleGuestExitWaiter(name);
+			}
+			return { inactiveGuest, transitionedFromActive: true, droppedQueuedCount };
+		}
+
+		const inactiveRecord = dismissedGuests.get(name);
+		if (!inactiveRecord) {
+			return { transitionedFromActive: false, droppedQueuedCount: 0 };
+		}
+		cancelCodexSessionScan(name);
+		trackGuestSessionId(inactiveRecord, sessionId, { writeRuntimeFile: false });
+		if (persist) {
+			persistSalonState();
+		}
+		if (settleWaiter) {
+			settleGuestExitWaiter(name);
+		}
+		return { inactiveGuest: inactiveRecord, transitionedFromActive: false, droppedQueuedCount: 0 };
 	}
 
 	function findCodexSessionCandidate(guest: GuestRecord, normalizedWorkDir: string): CodexSessionScanCandidate | undefined {
@@ -943,16 +1042,6 @@ export default function salonExtension(pi: ExtensionAPI) {
 		};
 	}
 
-	function captureFinalCodexSessionId(guest: Guest) {
-		if (guest.type === "codex" && !guest.sessionId) {
-			const candidate = findCodexSessionCandidate(guest, normalizePath(guest.workspaceDir));
-			if (candidate) {
-				claimGuestSessionId(guest, candidate.sessionId);
-			}
-		}
-		cancelCodexSessionScan(guest.name);
-	}
-
 	function removeGuestFromDiscussion(name: string) {
 		const discId = guestToDiscussion.get(name);
 		if (!discId) return;
@@ -977,16 +1066,9 @@ export default function salonExtension(pi: ExtensionAPI) {
 
 	function beginGuestDismissal(guest: Guest, teardownReason: GuestTeardownReason): Promise<void> {
 		const waitForExit = ensureGuestExitWaiter(guest);
-		if (guest.lifecycleStatus === "dismissing") {
-			guest.teardownReason = guest.teardownReason || teardownReason;
+		if (!transitionGuestToDismissing(guest, teardownReason)) {
 			return waitForExit;
 		}
-		guest.teardownReason = teardownReason;
-		captureFinalCodexSessionId(guest);
-		guest.lifecycleStatus = "dismissing";
-		removeGuestFromDiscussion(guest.name);
-		writeGuestRuntimeFile(guest);
-		persistSalonState();
 		// Interrupt first, then exit the shell explicitly so the wrapper can report the final session id.
 		try {
 			runtime.interrupt(guest.runtimeId);
@@ -1113,7 +1195,6 @@ export default function salonExtension(pi: ExtensionAPI) {
 			throw new Error(`Guest '${name}' is already active in the salon.`);
 		}
 
-		cancelCodexSessionScan(name);
 		const resumeWorkDir = dismissed.workspaceDir || workDir;
 
 		const instructionsFile = join(guestDir, `${name}.instructions`);
@@ -1159,15 +1240,12 @@ export default function salonExtension(pi: ExtensionAPI) {
 			workspaceDir: resumeWorkDir,
 			ready: false,
 		};
-		guests.set(name, guest);
-		dismissedGuests.delete(name);
-		if (guest.sessionId) claimedSessionIds.add(guest.sessionId);
-		queuedGuestMessages.delete(name);
-		writeGuestRuntimeFile(guest);
 
-		reactivateArchivedDiscussions();
-		persistSalonState();
-		return guest;
+		return activateGuestLifecycle(guest, {
+			dropDismissedRecord: true,
+			reactivateArchivedDiscussions: true,
+			persist: true,
+		});
 	}
 
 	function autoResumeAllSuspendedGuests(): ResumeFailure[] {
@@ -1221,7 +1299,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 			})),
 		}),
 		async execute(_id, params: any) {
-			const guest = inviteGuest(params.name, params.type, workDir, salonDir, guestDir, runtime);
+			const guest = activateGuestLifecycle(inviteGuest(params.name, params.type, workDir, salonDir, guestDir, runtime));
 			scanCodexSessionId(guest);
 			const initialMessageStatus = params.initial_message !== undefined
 				? sayToGuest(guest, params.initial_message)
@@ -1278,8 +1356,8 @@ export default function salonExtension(pi: ExtensionAPI) {
 			const nameB = params.guest_b_name || `${discId}_b`;
 
 			// Invite both guests — heterogeneous by default
-			const guestA = inviteGuest(nameA, typeA, workDir, salonDir, guestDir, runtime);
-			const guestB = inviteGuest(nameB, typeB, workDir, salonDir, guestDir, runtime);
+			const guestA = activateGuestLifecycle(inviteGuest(nameA, typeA, workDir, salonDir, guestDir, runtime));
+			const guestB = activateGuestLifecycle(inviteGuest(nameB, typeB, workDir, salonDir, guestDir, runtime));
 			scanCodexSessionId(guestA);
 			scanCodexSessionId(guestB);
 
@@ -1765,12 +1843,7 @@ When these appear, process them thoughtfully — don't just echo them to the use
 			// Handle guest lifecycle events
 			if (msg.from === "_system" && msg.content.startsWith("guest_ready:")) {
 				const name = msg.content.slice("guest_ready:".length);
-				const guest = guests.get(name);
-				if (guest && !guest.ready) {
-					guest.ready = true;
-					writeGuestRuntimeFile(guest);
-					flushQueuedGuestMessages(guest);
-				}
+				markGuestReady(name);
 				return;
 			}
 
@@ -1790,25 +1863,8 @@ When these appear, process them thoughtfully — don't just echo them to the use
 				const parts = msg.content.slice("guest_exited:".length).split(":");
 				const name = parts[0];
 				const sessionId = parts[1] || undefined;
-				const activeGuest = guests.get(name);
-				const inactiveRecord = dismissedGuests.get(name);
-				if (activeGuest) {
-					cancelCodexSessionScan(name);
-					if (!activeGuest.sessionId && sessionId) {
-						activeGuest.sessionId = sessionId;
-					}
-					if (activeGuest.sessionId) {
-						claimedSessionIds.add(activeGuest.sessionId);
-					}
-					const droppedQueuedCount = queuedGuestMessages.get(name)?.length || 0;
-					writeGuestRuntimeFile(activeGuest);
-					const inactiveGuest = buildInactiveGuestRecord(activeGuest);
-					guests.delete(name);
-					dismissedGuests.set(name, inactiveGuest);
-					queuedGuestMessages.delete(name);
-					removeGuestFromDiscussion(name);
-					persistSalonState();
-					settleGuestExitWaiter(name);
+				const { inactiveGuest, transitionedFromActive, droppedQueuedCount } = transitionGuestToInactive(name, sessionId);
+				if (inactiveGuest && transitionedFromActive) {
 					try {
 						runtime.equalize();
 					} catch {
@@ -1818,16 +1874,6 @@ When these appear, process them thoughtfully — don't just echo them to the use
 					const queueHint = droppedQueuedCount > 0 ? ` ${droppedQueuedCount} queued message(s) were never delivered.` : "";
 					const exitLabel = inactiveGuest.lifecycleStatus === "suspended" ? "has been suspended" : "has left the salon";
 					pi.sendUserMessage(`[salon] Guest '${name}' ${exitLabel}.${resumeHint}${queueHint}`, { deliverAs: "followUp" });
-				} else if (inactiveRecord) {
-					cancelCodexSessionScan(name);
-					if (!inactiveRecord.sessionId && sessionId) {
-						inactiveRecord.sessionId = sessionId;
-					}
-					if (inactiveRecord.sessionId) {
-						claimedSessionIds.add(inactiveRecord.sessionId);
-					}
-					persistSalonState();
-					settleGuestExitWaiter(name);
 				}
 				return;
 			}
@@ -1862,11 +1908,10 @@ When these appear, process them thoughtfully — don't just echo them to the use
 
 		for (const [name, guest] of Array.from(guests.entries())) {
 			if (guest.lifecycleStatus !== "dismissing") continue;
-			settleGuestExitWaiter(name);
-			if (guest.sessionId) writeGuestRuntimeFile(guest);
-			guests.delete(name);
-			const inactiveGuest = buildInactiveGuestRecord(guest);
-			dismissedGuests.set(name, inactiveGuest);
+			transitionGuestToInactive(name, undefined, {
+				persist: false,
+				runtimeFileMode: "ifSessionTracked",
+			});
 		}
 		persistSalonState();
 

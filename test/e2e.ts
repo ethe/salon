@@ -485,9 +485,10 @@ console.log("\n== 17. invite_guest + sayToGuest(initial_message) → queue → f
 {
 	// Full extension-layer test of the invite_guest(initial_message) path:
 	// 1. inviteGuest() creates a guest with ready=false
-	// 2. sayToGuestImpl() queues the initial_message
-	// 3. Simulating guest_ready: flip ready + flushQueuedGuestMessagesImpl()
-	// 4. Verify runtime.send() receives the correct prefixed message
+	// 2. The extension registers the guest in active state
+	// 3. sayToGuestImpl() queues the initial_message
+	// 4. Simulating guest_ready: flip ready + flushQueuedGuestMessagesImpl()
+	// 5. Verify runtime.send() receives the correct prefixed message
 	const { inviteGuest, sayToGuestImpl, flushQueuedGuestMessagesImpl, guests, queuedGuestMessages } = extensionTest;
 	const sentMessages: Array<{ runtimeId: string; text: string }> = [];
 	const fakeRuntime = {
@@ -510,19 +511,23 @@ console.log("\n== 17. invite_guest + sayToGuest(initial_message) → queue → f
 	// Step 1: inviteGuest creates guest with ready=false
 	const guest = inviteGuest("invite-test", "claude", "/tmp", SALON_DIR, GUEST_DIR, fakeRuntime);
 	assert("Guest created with ready=false", guest.ready === false);
-	assert("Guest registered in guests map", guests.has("invite-test"));
+	assert("Guest is not auto-registered before lifecycle activation", !guests.has("invite-test"));
 
-	// Step 2: sayToGuest queues the initial_message (mimics invite_guest execute)
+	// Step 2: the lifecycle transition registers the guest as active
+	guests.set("invite-test", guest);
+	assert("Guest registered in guests map after activation", guests.has("invite-test"));
+
+	// Step 3: sayToGuest queues the initial_message (mimics invite_guest execute)
 	const status = sayToGuestImpl(fakeCtx, guest, "please review the code");
 	assert("initial_message returns 'queued'", status === "queued");
 	assert("No runtime.send() before ready", sentMessages.length === 0);
 	assert("Message queued in queuedGuestMessages", queuedGuestMessages.get("invite-test")?.length === 1);
 
-	// Step 3: Simulate guest_ready event → flip ready + flush
+	// Step 4: Simulate guest_ready event → flip ready + flush
 	guest.ready = true;
 	flushQueuedGuestMessagesImpl(fakeCtx, guest);
 
-	// Step 4: Verify runtime received the message
+	// Step 5: Verify runtime received the message
 	assert("runtime.send() called after flush", sentMessages.length === 1);
 	assert("Message has [host]: prefix", sentMessages[0].text === "[host]: please review the code");
 	assert("Queue empty after flush", !queuedGuestMessages.has("invite-test"));
