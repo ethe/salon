@@ -1,11 +1,14 @@
 /**
- * TmuxBackend — GuestRuntime implementation backed by tmux panes.
+ * Tmux-backed implementations of salon runtime interfaces.
+ *
+ * - TmuxLauncher: session bootstrap (create, attach, env, host launch)
+ * - TmuxBackend: guest-level operations (spawn, send, status, focus)
  */
 
 import { execFileSync } from "node:child_process";
 import { chmodSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { GuestRuntime, GuestStatus, RuntimeSpawnOptions } from "./runtime.js";
+import type { GuestRuntime, GuestStatus, RuntimeSpawnOptions, SalonLauncher } from "./runtime.js";
 
 function shellQuote(value: string): string {
 	return `'${value.replace(/'/g, `'\\''`)}'`;
@@ -226,5 +229,67 @@ export class TmuxBackend implements GuestRuntime {
 			`fi`,
 			`send_system_event "guest_exited:${options.name}:$SESSION_ID"`,
 		].join("\n");
+	}
+}
+
+// ── Session-level bootstrap ──────────────────────────────────────────
+
+export class TmuxLauncher implements SalonLauncher {
+	private readonly tmuxSession: string;
+
+	constructor(tmuxSession: string) {
+		this.tmuxSession = tmuxSession;
+	}
+
+	preflight(): void {
+		execFileSync("tmux", ["-V"], { stdio: "pipe" });
+	}
+
+	sessionExists(): boolean {
+		try {
+			execFileSync("tmux", ["has-session", "-t", this.tmuxSession], { stdio: "pipe" });
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	createSession(workDir: string): void {
+		if (!this.sessionExists()) {
+			this.tmux(["new-session", "-d", "-s", this.tmuxSession, "-x", "200", "-y", "50", "-c", workDir]);
+		}
+		this.tmux(["set-option", "-t", this.tmuxSession, "-g", "mouse", "on"]);
+		this.tmux(["set-option", "-t", this.tmuxSession, "-g", "extended-keys", "on"]);
+		this.tmux(["set-option", "-t", this.tmuxSession, "-g", "extended-keys-format", "csi-u"]);
+		this.tmux(["rename-window", "-t", `${this.tmuxSession}:0`, "salon"]);
+	}
+
+	destroySession(): void {
+		this.tmux(["kill-session", "-t", this.tmuxSession]);
+	}
+
+	attach(): void {
+		execFileSync("tmux", ["attach", "-t", this.tmuxSession], { stdio: "inherit" });
+	}
+
+	setEnvironment(vars: Record<string, string>): void {
+		for (const [key, value] of Object.entries(vars)) {
+			this.tmux(["set-environment", "-t", this.tmuxSession, key, value]);
+		}
+	}
+
+	launchHost(command: string): void {
+		const hostPane = `${this.tmuxSession}:0.0`;
+		const envSetup = `eval "$(tmux show-environment -t ${shellQuote(this.tmuxSession)} -s)" && export PATH="$SALON_NODE_BIN:$PATH"`;
+		this.tmux(["send-keys", "-t", hostPane, "-l", `${envSetup} && exec ${command}`]);
+		this.tmux(["send-keys", "-t", hostPane, "Enter"]);
+	}
+
+	private tmux(args: string[]): string {
+		try {
+			return execFileSync("tmux", args, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).trim();
+		} catch {
+			return "";
+		}
 	}
 }

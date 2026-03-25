@@ -1,8 +1,10 @@
 /**
- * GuestRuntime — abstract interface for guest agent execution environments.
+ * Runtime abstractions for salon.
  *
- * The extension orchestration logic programs against this interface.
- * Concrete backends (e.g. TmuxBackend) implement the actual mechanics.
+ * - SalonLauncher: session-level bootstrap (create, attach, env, host launch)
+ * - GuestRuntime: guest-level operations (spawn, send, status, focus)
+ *
+ * Concrete backends (e.g. TmuxLauncher, TmuxBackend) implement these.
  */
 
 export type GuestStatus = "starting" | "working" | "input" | "idle" | "new";
@@ -49,4 +51,29 @@ export interface GuestRuntime {
 
 	/** Adopt an existing runtime (e.g. after session restore). Backend configures transport based on guestType. */
 	adopt(runtimeId: string, guestType: "claude" | "codex"): void;
+}
+
+// ── Session-level bootstrap ──────────────────────────────────────────
+
+export interface SalonLauncher {
+	/** Check that the runtime backend is available (e.g. tmux is installed). Throws if not. */
+	preflight(): void;
+
+	/** Check whether a session already exists. */
+	sessionExists(): boolean;
+
+	/** Create a new session and configure it. */
+	createSession(workDir: string): void;
+
+	/** Destroy an existing session. */
+	destroySession(): void;
+
+	/** Attach to the session (blocks until detach). */
+	attach(): void;
+
+	/** Inject environment variables into the session. */
+	setEnvironment(vars: Record<string, string>): void;
+
+	/** Launch the host agent in the session's primary pane. */
+	launchHost(command: string): void;
 }

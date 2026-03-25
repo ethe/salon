@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
-import { execFileSync } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
+import type { SalonLauncher } from "./runtime.js";
+import { TmuxLauncher } from "./tmux-backend.js";
 
 const SCRIPT_DIR = resolve(import.meta.dirname, "..");
 const WORK_DIR = process.argv[2] ? resolve(process.argv[2]) : process.cwd();
@@ -10,7 +11,6 @@ const SALON_INSTANCE = process.env.SALON_INSTANCE || deriveSalonInstance(WORK_DI
 const SALON_DIR = process.env.SALON_DIR || join(process.env.HOME!, ".salon", SALON_INSTANCE);
 const HOST_SESSION_DIR = join(SALON_DIR, "host-sessions");
 const TMUX_SESSION = process.env.SALON_TMUX_SESSION || `salon-${SALON_INSTANCE}`;
-const HOST_PANE = `${TMUX_SESSION}:0.0`;
 
 type ExistingSessionAction = "kill" | "attach";
 
@@ -32,23 +32,6 @@ function joinShellArgs(args: string[]): string {
 	return args.map(shellQuote).join(" ");
 }
 
-function tmux(args: string[]): string {
-	try {
-		return execFileSync("tmux", args, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).trim();
-	} catch {
-		return "";
-	}
-}
-
-function tmuxSessionExists(): boolean {
-	try {
-		execFileSync("tmux", ["has-session", "-t", TMUX_SESSION], { stdio: "pipe" });
-		return true;
-	} catch {
-		return false;
-	}
-}
-
 function prompt(question: string): Promise<string> {
 	const rl = createInterface({ input: process.stdin, output: process.stdout });
 	return new Promise((resolvePrompt) => {
@@ -59,32 +42,13 @@ function prompt(question: string): Promise<string> {
 	});
 }
 
-function tmuxSendLine(target: string, line: string) {
-	tmux(["send-keys", "-t", target, "-l", line]);
-	tmux(["send-keys", "-t", target, "Enter"]);
-}
-
 async function chooseExistingSessionAction(): Promise<ExistingSessionAction> {
 	const answer = (await prompt(`Session '${TMUX_SESSION}' exists. [k]ill / [a]ttach? [a] `)).toLowerCase();
 	if (answer === "k" || answer === "kill") return "kill";
 	return "attach";
 }
 
-function configureTmuxSession() {
-	tmux(["set-option", "-t", TMUX_SESSION, "-g", "mouse", "on"]);
-	tmux(["set-option", "-t", TMUX_SESSION, "-g", "extended-keys", "on"]);
-	tmux(["set-option", "-t", TMUX_SESSION, "-g", "extended-keys-format", "csi-u"]);
-	tmux(["rename-window", "-t", `${TMUX_SESSION}:0`, "salon"]);
-}
-
-function ensureTmuxSession() {
-	if (!tmuxSessionExists()) {
-		tmux(["new-session", "-d", "-s", TMUX_SESSION, "-x", "200", "-y", "50", "-c", WORK_DIR]);
-	}
-	configureTmuxSession();
-}
-
-function setTmuxEnvironment() {
+function buildEnvironment(): Record<string, string> {
 	const vars: Record<string, string> = {};
 
 	for (const key of [
@@ -100,24 +64,16 @@ function setTmuxEnvironment() {
 	vars.SALON_WORK_DIR = WORK_DIR;
 	vars.SALON_NODE_BIN = dirname(process.execPath);
 
-	for (const [key, value] of Object.entries(vars)) {
-		tmux(["set-environment", "-t", TMUX_SESSION, key, value]);
-	}
+	return vars;
 }
 
-function launchHost() {
-	setTmuxEnvironment();
+// ── Main ─────────────────────────────────────────────────────────────
 
-	const extensionPath = join(SCRIPT_DIR, "src", "extension.ts");
-	const piBin = join(SCRIPT_DIR, "node_modules", ".bin", "pi");
-	const piCommand = joinShellArgs([piBin, "--extension", extensionPath]);
-
-	tmuxSendLine(HOST_PANE, `eval "$(tmux show-environment -t ${shellQuote(TMUX_SESSION)} -s)" && export PATH="$SALON_NODE_BIN:$PATH" && exec ${piCommand}`);
-}
+const launcher: SalonLauncher = new TmuxLauncher(TMUX_SESSION);
 
 // Preflight
 try {
-	execFileSync("tmux", ["-V"], { stdio: "pipe" });
+	launcher.preflight();
 } catch {
 	console.error("Error: tmux not found.");
 	process.exit(1);
@@ -127,25 +83,30 @@ try {
 mkdirSync(join(SALON_DIR, "guests"), { recursive: true });
 mkdirSync(HOST_SESSION_DIR, { recursive: true });
 
-if (tmuxSessionExists()) {
+if (launcher.sessionExists()) {
 	const action = await chooseExistingSessionAction();
 	if (action === "attach") {
 		try {
-			execFileSync("tmux", ["attach", "-t", TMUX_SESSION], { stdio: "inherit" });
+			launcher.attach();
 		} catch {
-			// tmux exited while attaching; just exit.
+			// session exited while attaching; just exit.
 		}
 		process.exit(0);
 	}
-	tmux(["kill-session", "-t", TMUX_SESSION]);
+	launcher.destroySession();
 }
 
-ensureTmuxSession();
-launchHost();
+launcher.createSession(WORK_DIR);
+launcher.setEnvironment(buildEnvironment());
+
+const extensionPath = join(SCRIPT_DIR, "src", "extension.ts");
+const piBin = join(SCRIPT_DIR, "node_modules", ".bin", "pi");
+const hostCommand = joinShellArgs([piBin, "--extension", extensionPath]);
+launcher.launchHost(hostCommand);
 
 // Attach
 try {
-	execFileSync("tmux", ["attach", "-t", TMUX_SESSION], { stdio: "inherit" });
+	launcher.attach();
 } catch {
-	// tmux exited
+	// session exited
 }
