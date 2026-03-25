@@ -11,10 +11,12 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, realpathSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, realpathSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { createServer, type Server } from "node:net";
+import type { GuestRuntime, GuestStatus } from "./runtime.js";
+import { TmuxBackend } from "./tmux-backend.js";
 
 const SALON_INSTANCE = process.env.SALON_INSTANCE || "default";
 const TMUX_SESSION = process.env.SALON_TMUX_SESSION || `salon-${SALON_INSTANCE}`;
@@ -23,7 +25,6 @@ const SALON_STATE_VERSION = 1;
 type GuestType = "claude" | "codex";
 type GuestTeardownReason = "host" | "user";
 type GuestLifecycleStatus = "active" | "dismissing" | "suspended" | "dismissed";
-type GuestStatus = "starting" | "working" | "input" | "idle" | "new";
 
 interface GuestRuntimeFile {
 	name: string;
@@ -48,7 +49,6 @@ interface GuestRecord {
 
 interface GuestRuntimeHandle {
 	runtimeId: string;
-	submitMode: string;
 	ready: boolean;
 }
 
@@ -160,107 +160,6 @@ function cancelCodexSessionScan(name: string) {
 		clearTimeout(timer);
 		activeCodexSessionScans.delete(name);
 	}
-}
-
-function tmux(args: string[]): string {
-	try {
-		return execFileSync("tmux", args, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).trim();
-	} catch {
-		return "";
-	}
-}
-
-function equalizeGuestPanes() {
-	const panes = tmux(["list-panes", "-t", `${TMUX_SESSION}:0`, "-F", "#{pane_id}"]).split("\n").filter(Boolean);
-	if (panes.length <= 1) return;
-	const totalWidth = tmux(["display-message", "-t", `${TMUX_SESSION}:0`, "-p", "#{window_width}"]);
-	const halfWidth = Math.floor(Number(totalWidth) / 2);
-	tmux(["set-option", "-t", `${TMUX_SESSION}:0`, "main-pane-width", String(halfWidth)]);
-	tmux(["select-layout", "-t", `${TMUX_SESSION}:0`, "main-vertical"]);
-	tmux(["select-pane", "-t", `${TMUX_SESSION}:0.0`]);
-}
-
-function spawnPane(workDir: string): string {
-	const paneCount = tmux(["list-panes", "-t", `${TMUX_SESSION}:0`, "-F", "#{pane_id}"]).split("\n").filter(Boolean).length;
-	let newPaneId: string;
-	if (paneCount <= 1) {
-		newPaneId = tmux(["split-window", "-h", "-t", `${TMUX_SESSION}:0.0`, "-p", "50", "-c", workDir, "-P", "-F", "#{pane_id}"]);
-	} else {
-		const lastPane = tmux(["list-panes", "-t", `${TMUX_SESSION}:0`, "-F", "#{pane_id}"]).split("\n").filter(Boolean).pop()!;
-		newPaneId = tmux(["split-window", "-v", "-t", lastPane, "-c", workDir, "-P", "-F", "#{pane_id}"]);
-	}
-	equalizeGuestPanes();
-	return newPaneId;
-}
-
-// ── Guest status detection (inspired by gavraz/recon) ─────────────────
-function detectGuestStatus(paneId: string): GuestStatus {
-	const content = tmux(["capture-pane", "-t", paneId, "-p"]);
-	if (!content) return "new";
-
-	let linesChecked = 0;
-	const lines = content.split("\n");
-	for (let i = lines.length - 1; i >= 0; i--) {
-		const trimmed = lines[i].trim();
-		if (!trimmed) continue;
-
-		// Input: permission prompt (Claude Code)
-		if (linesChecked === 0 && trimmed.includes("Esc to cancel")) {
-			return "input";
-		}
-
-		// Working: spinner characters with ellipsis (Claude Code)
-		const first = trimmed.charAt(0);
-		if ("\u273D\u2722\u2733\u2736\u23FA\u2726\u2727\u2728\u2729\u272A\u272B\u272C\u272D\u272E\u272F\u2730\u2731\u2732\u2734\u2735\u2737\u2738\u2739\u273A\u273B\u273C".includes(first) && trimmed.includes("\u2026")) {
-			return "working";
-		}
-
-		// Input: selection menu "❯ N." (Claude Code approval)
-		const idx = trimmed.indexOf("\u276F");
-		if (idx >= 0) {
-			const after = trimmed.slice(idx + 1).trimStart();
-			if (/^\d/.test(after)) return "input";
-		}
-
-		// Codex: check for "›" prompt with no content after = idle
-		// Codex working: has a spinner/progress indicator
-
-		linesChecked++;
-		if (linesChecked >= 10) break;
-	}
-
-	return "idle";
-}
-
-// Per-pane async send queue: TUI applications need time to process pasted text
-// before receiving the submit key. This queue serializes sends per pane with a
-// non-blocking delay between text and submit, avoiding event loop blocking.
-const paneSendQueues = new Map<string, Array<{ text: string; submitKey: string }>>();
-const paneSendActive = new Set<string>();
-
-function sendKeys(paneId: string, text: string, submitKey = "Enter") {
-	const queue = paneSendQueues.get(paneId) || [];
-	queue.push({ text, submitKey });
-	paneSendQueues.set(paneId, queue);
-	drainPaneSendQueue(paneId);
-}
-
-function drainPaneSendQueue(paneId: string) {
-	if (paneSendActive.has(paneId)) return;
-	const queue = paneSendQueues.get(paneId);
-	if (!queue?.length) {
-		paneSendQueues.delete(paneId);
-		return;
-	}
-
-	paneSendActive.add(paneId);
-	const item = queue.shift()!;
-	tmux(["send-keys", "-l", "-t", paneId, item.text]);
-	setTimeout(() => {
-		tmux(["send-keys", "-t", paneId, item.submitKey]);
-		paneSendActive.delete(paneId);
-		drainPaneSendQueue(paneId);
-	}, 200);
 }
 
 // ── Unix socket server for receiving guest messages ───────────────────
@@ -384,10 +283,6 @@ function getCodexSessionDateDirs(startedAt: number): string[] {
 	return Array.from(dirs);
 }
 
-function submitKeyForGuestType(type: GuestType): string {
-	return type === "codex" ? "C-m" : "Enter";
-}
-
 function serializeDiscussionRound(round: DiscussionRound): PersistedDiscussionRound {
 	return { responses: Object.fromEntries(round.responses) };
 }
@@ -475,64 +370,6 @@ function isBetterCodexSessionCandidate(
 	return next.sessionId < current.sessionId;
 }
 
-function buildGuestExitWrapperScript(options: {
-	name: string;
-	salonDir: string;
-	workDir: string;
-	command: string;
-	initialSessionId?: string;
-}): string {
-	const sockPath = join(options.salonDir, "salon.sock");
-	const tmuxSession = process.env.SALON_TMUX_SESSION || "";
-	return [
-		`#!/usr/bin/env bash`,
-		`set -uo pipefail -m`,
-		...(tmuxSession ? [`eval "$(tmux show-environment -t ${shellQuote(tmuxSession)} -s)"`] : []),
-		`export PATH="$SALON_NODE_BIN:$PATH"`,
-		`export SALON_DIR=${shellQuote(options.salonDir)} SALON_GUEST_NAME=${shellQuote(options.name)}`,
-		`SOCK=${shellQuote(sockPath)}`,
-		`send_system_event() {`,
-		`  local event="$1"`,
-		`  printf '{"from":"_system","content":"%s"}' "$event" | nc -U "$SOCK" 2>/dev/null || true`,
-		`}`,
-		`(`,
-		`  for _ in $(seq 1 150); do`,
-		`    CURRENT_COMMAND=$(tmux display-message -p -t "$TMUX_PANE" "#{pane_current_command}" 2>/dev/null || true)`,
-		`    if [ -n "$CURRENT_COMMAND" ] && [ "$CURRENT_COMMAND" != "bash" ] && [ "$CURRENT_COMMAND" != "zsh" ] && [ "$CURRENT_COMMAND" != "sh" ]; then`,
-		`      for _ in $(seq 1 60); do`,
-		`        PANE_CONTENT=$(tmux capture-pane -t "$TMUX_PANE" -p 2>/dev/null || true)`,
-		`        if printf '%s' "$PANE_CONTENT" | grep -qE '❯|› '; then`,
-		`          sleep 0.3`,
-		`          send_system_event "guest_ready:${options.name}"`,
-		`          exit 0`,
-		`        fi`,
-		`        sleep 0.5`,
-		`      done`,
-		`      send_system_event "guest_ready:${options.name}"`,
-		`      exit 0`,
-		`    fi`,
-		`    sleep 0.2`,
-		`  done`,
-		`  send_system_event "guest_ready_timeout:${options.name}"`,
-		`) &`,
-		`READY_WATCHER=$!`,
-		`cd ${shellQuote(options.workDir)}`,
-		// Do not use exec; after the command exits we still need to extract the session id and notify the host.
-		options.command,
-		`wait "$READY_WATCHER" 2>/dev/null || true`,
-		`SESSION_ID=${shellQuote(options.initialSessionId || "")}`,
-		`if [ -z "$SESSION_ID" ]; then`,
-		`  CAPTURED=$(tmux capture-pane -t "$TMUX_PANE" -p -S -20 2>/dev/null || true)`,
-		`  SESSION_ID=$(echo "$CAPTURED" | grep -o 'claude --resume [^ ]*' | tail -1 | awk '{print $3}')`,
-		`fi`,
-		`if [ -z "$SESSION_ID" ]; then`,
-		`  CAPTURED=$(tmux capture-pane -t "$TMUX_PANE" -p -S -20 2>/dev/null || true)`,
-		`  SESSION_ID=$(echo "$CAPTURED" | grep -o 'codex resume [^ ]*' | tail -1 | awk '{print $3}')`,
-		`fi`,
-		`send_system_event "guest_exited:${options.name}:$SESSION_ID"`,
-	].join("\n");
-}
-
 function formatRecoveredSalonSummary(input: RecoveredSalonSummaryInput): string | undefined {
 	if (
 		input.activeGuests.length === 0 &&
@@ -600,47 +437,17 @@ function inviteGuest(
 	workDir: string,
 	salonDir: string,
 	guestDir: string,
+	runtime: GuestRuntime,
 ): Guest {
 	name = sanitizeGuestName(name);
 	if (guests.has(name)) throw new Error(`Guest '${name}' is already in the salon`);
 
 	cancelCodexSessionScan(name);
 
-	const runtimeId = spawnPane(workDir);
-	if (!runtimeId) throw new Error("Failed to create tmux pane");
-
-	const submitMode = submitKeyForGuestType(type);
 	const sessionId = type === "claude" ? randomUUID() : undefined;
 	const nonce = type === "codex" ? createCodexGuestNonce() : undefined;
-	const guest: Guest = {
-		name,
-		type,
-		runtimeId,
-		submitMode,
-		sessionId,
-		nonce,
-		startedAt: Date.now(),
-		lifecycleStatus: "active",
-		workspaceDir: workDir,
-		ready: false,
-	};
-	guests.set(name, guest);
-	if (guest.sessionId) claimedSessionIds.add(guest.sessionId);
-	queuedGuestMessages.delete(name);
-	writeFileSync(join(guestDir, `${name}.json`), JSON.stringify({
-		name: guest.name,
-		type: guest.type,
-		paneId: guest.runtimeId,
-		sessionId: guest.sessionId,
-		nonce: guest.nonce,
-		startedAt: serializeStartedAt(guest.startedAt),
-		workspaceDir: guest.workspaceDir,
-	} satisfies GuestRuntimeFile, null, 2));
 
-	const instructions = buildGuestInstructions(guest.nonce);
-
-	// Inject guest role into system prompt, not as a chat message
-	// Write instructions to a temp file to avoid shell escaping issues
+	const instructions = buildGuestInstructions(nonce);
 	const instructionsFile = join(guestDir, `${name}.instructions`);
 	writeFileSync(instructionsFile, instructions);
 
@@ -661,18 +468,38 @@ function inviteGuest(
 		]);
 	}
 
-	// Wrapper script: run agent, capture session ID after exit, notify host, then shell exits (pane closes)
-	const wrapperScript = join(guestDir, `${name}.wrapper.sh`);
-	writeFileSync(wrapperScript, buildGuestExitWrapperScript({
+	const runtimeId = runtime.spawn({
 		name,
-		salonDir,
+		guestType: type,
 		workDir,
 		command: cmd,
-		initialSessionId: guest.sessionId,
-	}));
-	chmodSync(wrapperScript, 0o755);
+		salonDir,
+		initialSessionId: sessionId,
+	});
 
-	sendKeys(runtimeId, `exec bash ${shellQuote(wrapperScript)}`);
+	const guest: Guest = {
+		name,
+		type,
+		runtimeId,
+		sessionId,
+		nonce,
+		startedAt: Date.now(),
+		lifecycleStatus: "active",
+		workspaceDir: workDir,
+		ready: false,
+	};
+	guests.set(name, guest);
+	if (guest.sessionId) claimedSessionIds.add(guest.sessionId);
+	queuedGuestMessages.delete(name);
+	writeFileSync(join(guestDir, `${name}.json`), JSON.stringify({
+		name: guest.name,
+		type: guest.type,
+		paneId: guest.runtimeId,
+		sessionId: guest.sessionId,
+		nonce: guest.nonce,
+		startedAt: serializeStartedAt(guest.startedAt),
+		workspaceDir: guest.workspaceDir,
+	} satisfies GuestRuntimeFile, null, 2));
 
 	return guest;
 }
@@ -680,6 +507,7 @@ function inviteGuest(
 export default function salonExtension(pi: ExtensionAPI) {
 	const salonDir = process.env.SALON_DIR || join("/tmp", "salon", SALON_INSTANCE);
 	const guestDir = join(salonDir, "guests");
+	const runtime: GuestRuntime = new TmuxBackend(TMUX_SESSION);
 	const hostSessionDir = join(salonDir, "host-sessions");
 	const workDir = process.env.SALON_WORK_DIR || process.cwd();
 
@@ -960,9 +788,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 	function restoreSalonState(snapshot: SalonStateSnapshot) {
 		clearRuntimeState();
 
-		const livePanes = new Set(
-			tmux(["list-panes", "-t", `${TMUX_SESSION}:0`, "-F", "#{pane_id}"]).split("\n").filter(Boolean),
-		);
+		const livePanes = new Set(runtime.listAlive());
 
 		for (const persistedGuest of Object.values(snapshot.guests || {})) {
 			const runtimeGuest = readGuestRuntimeFile(persistedGuest.name);
@@ -988,9 +814,9 @@ export default function salonExtension(pi: ExtensionAPI) {
 				const guest: Guest = {
 					...record,
 					runtimeId: runtimeGuest.paneId,
-					submitMode: submitKeyForGuestType(record.type),
 					ready: true,
 				};
+				runtime.adopt(runtimeGuest.paneId, record.type);
 				guests.set(guest.name, guest);
 				continue;
 			}
@@ -1020,7 +846,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 	function getGuestDisplayStatus(guest: Guest): string {
 		if (guest.lifecycleStatus === "dismissing") return "dismissing";
 		if (!guest.ready) return "starting";
-		return detectGuestStatus(guest.runtimeId);
+		return runtime.getStatus(guest.runtimeId);
 	}
 
 	function resolveInactiveGuestStatus(guest: Guest): "suspended" | "dismissed" {
@@ -1085,10 +911,8 @@ export default function salonExtension(pi: ExtensionAPI) {
 		writeGuestRuntimeFile(guest);
 		persistSalonState();
 		// Interrupt first, then exit the shell explicitly so the wrapper can report the final session id.
-		tmux(["send-keys", "-t", guest.runtimeId, "C-c"]);
-		tmux(["send-keys", "-t", guest.runtimeId, "C-c"]);
-		tmux(["send-keys", "-t", guest.runtimeId, "-l", "exit"]);
-		tmux(["send-keys", "-t", guest.runtimeId, "Enter"]);
+		runtime.interrupt(guest.runtimeId);
+		runtime.terminate(guest.runtimeId);
 		return waitForExit;
 	}
 
@@ -1111,14 +935,14 @@ export default function salonExtension(pi: ExtensionAPI) {
 
 		const prefix = `[${from}]: `;
 		if (message.length <= MSG_LENGTH_THRESHOLD) {
-			sendKeys(guest.runtimeId, `${prefix}${message}`, guest.submitMode);
+			runtime.send(guest.runtimeId, `${prefix}${message}`);
 		} else {
 			// Long messages: write to file, send short reference via send-keys
 			const exchangeDir = join(salonDir, "exchange");
 			mkdirSync(exchangeDir, { recursive: true });
 			const msgFile = join(exchangeDir, `${++msgFileCounter}_${safeLabelForFilename(from)}.md`);
 			writeFileSync(msgFile, message);
-			sendKeys(guest.runtimeId, `${prefix}Read ${msgFile} and respond.`, guest.submitMode);
+			runtime.send(guest.runtimeId, `${prefix}Read ${msgFile} and respond.`);
 		}
 	}
 
@@ -1252,31 +1076,11 @@ export default function salonExtension(pi: ExtensionAPI) {
 
 		cancelCodexSessionScan(name);
 		const resumeWorkDir = dismissed.workspaceDir || workDir;
-		const runtimeId = spawnPane(resumeWorkDir);
-		if (!runtimeId) throw new Error("Failed to create tmux pane");
-
-		const guest: Guest = {
-			name: dismissed.name,
-			type: dismissed.type,
-			runtimeId,
-			submitMode: submitKeyForGuestType(dismissed.type),
-			sessionId: dismissed.sessionId,
-			nonce: dismissed.nonce,
-			startedAt: Date.now(),
-			lifecycleStatus: "active",
-			workspaceDir: resumeWorkDir,
-			ready: false,
-		};
-		guests.set(name, guest);
-		dismissedGuests.delete(name);
-		if (guest.sessionId) claimedSessionIds.add(guest.sessionId);
-		queuedGuestMessages.delete(name);
-		writeGuestRuntimeFile(guest);
 
 		const instructionsFile = join(guestDir, `${name}.instructions`);
 		// Instructions file should still exist from the original invite
 		if (!existsSync(instructionsFile)) {
-			writeFileSync(instructionsFile, buildGuestInstructions(guest.nonce));
+			writeFileSync(instructionsFile, buildGuestInstructions(dismissed.nonce));
 		}
 
 		let cmd: string;
@@ -1296,18 +1100,32 @@ export default function salonExtension(pi: ExtensionAPI) {
 			]);
 		}
 
-		// Wrapper script: run agent, capture session ID after exit, notify host
-		const wrapperScript = join(guestDir, `${name}.wrapper.sh`);
-		writeFileSync(wrapperScript, buildGuestExitWrapperScript({
+		const runtimeId = runtime.spawn({
 			name,
-			salonDir,
+			guestType: dismissed.type,
 			workDir: resumeWorkDir,
 			command: cmd,
+			salonDir,
 			initialSessionId: dismissed.sessionId,
-		}));
-		chmodSync(wrapperScript, 0o755);
+		});
 
-		sendKeys(runtimeId, `exec bash ${shellQuote(wrapperScript)}`);
+		const guest: Guest = {
+			name: dismissed.name,
+			type: dismissed.type,
+			runtimeId,
+			sessionId: dismissed.sessionId,
+			nonce: dismissed.nonce,
+			startedAt: Date.now(),
+			lifecycleStatus: "active",
+			workspaceDir: resumeWorkDir,
+			ready: false,
+		};
+		guests.set(name, guest);
+		dismissedGuests.delete(name);
+		if (guest.sessionId) claimedSessionIds.add(guest.sessionId);
+		queuedGuestMessages.delete(name);
+		writeGuestRuntimeFile(guest);
+
 		reactivateArchivedDiscussions();
 		persistSalonState();
 		return guest;
@@ -1354,7 +1172,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 			name: Type.String({ description: "Unique guest name, e.g. 'researcher', 'reviewer'" }),
 		}),
 		async execute(_id, params: any) {
-			const guest = inviteGuest(params.name, params.type, workDir, salonDir, guestDir);
+			const guest = inviteGuest(params.name, params.type, workDir, salonDir, guestDir, runtime);
 			scanCodexSessionId(guest);
 				persistSalonState();
 
@@ -1398,8 +1216,8 @@ export default function salonExtension(pi: ExtensionAPI) {
 			const nameB = params.guest_b_name || `${discId}_b`;
 
 			// Invite both guests — heterogeneous by default
-			const guestA = inviteGuest(nameA, typeA, workDir, salonDir, guestDir);
-			const guestB = inviteGuest(nameB, typeB, workDir, salonDir, guestDir);
+			const guestA = inviteGuest(nameA, typeA, workDir, salonDir, guestDir, runtime);
+			const guestB = inviteGuest(nameB, typeB, workDir, salonDir, guestDir, runtime);
 			scanCodexSessionId(guestA);
 			scanCodexSessionId(guestB);
 
@@ -1910,7 +1728,7 @@ When these appear, process them thoughtfully — don't just echo them to the use
 					removeGuestFromDiscussion(name);
 					persistSalonState();
 					settleGuestExitWaiter(name);
-					equalizeGuestPanes();
+					runtime.equalize();
 					const resumeHint = inactiveGuest.sessionId ? ` Session saved — use resume_guest to bring them back.` : "";
 					const queueHint = droppedQueuedCount > 0 ? ` ${droppedQueuedCount} queued message(s) were never delivered.` : "";
 					const exitLabel = inactiveGuest.lifecycleStatus === "suspended" ? "has been suspended" : "has left the salon";
@@ -1965,7 +1783,7 @@ When these appear, process them thoughtfully — don't just echo them to the use
 		messageServer?.close();
 		if (existsSync(socketPath)) unlinkSync(socketPath);
 		if (options.killTmuxSession) {
-			tmux(["kill-session", "-t", TMUX_SESSION]);
+			runtime.destroySession();
 		}
 	}
 
@@ -2016,8 +1834,8 @@ When these appear, process them thoughtfully — don't just echo them to the use
 		handler: async (_args, ctx) => {
 			for (const [, guest] of guests) {
 				if (guest.lifecycleStatus !== "active") continue;
-				if (detectGuestStatus(guest.runtimeId) === "input") {
-					tmux(["select-pane", "-t", guest.runtimeId]);
+				if (runtime.getStatus(guest.runtimeId) === "input") {
+					runtime.focus(guest.runtimeId);
 					ctx.ui.notify(`Switched to ${guest.name} (needs input)`, "info");
 					return;
 				}
@@ -2041,7 +1859,6 @@ When these appear, process them thoughtfully — don't just echo them to the use
 }
 
 export const __test__ = {
-	buildGuestExitWrapperScript,
 	formatRecoveredSalonSummary,
 	sanitizeGuestName,
 };

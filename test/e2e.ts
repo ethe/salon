@@ -7,6 +7,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, unlinkSync 
 import { join } from "node:path";
 import { createServer, type Server } from "node:net";
 import { __test__ as extensionTest } from "../src/extension.ts";
+import { TmuxBackend } from "../src/tmux-backend.ts";
 
 const TMUX_SESSION = "salon-test";
 const SALON_DIR = "/tmp/salon-test";
@@ -248,8 +249,10 @@ console.log("\n== 10. Environment variable forwarding ==");
 
 console.log("\n== 11. Guest wrapper emits ready and exit lifecycle events ==");
 {
-	const script = extensionTest.buildGuestExitWrapperScript({
+	const backend = new TmuxBackend(TMUX_SESSION);
+	const script = backend.buildWrapperScript({
 		name: "ready-test",
+		guestType: "claude",
 		salonDir: SALON_DIR,
 		workDir: "/tmp/ready-test",
 		command: "echo hello",
