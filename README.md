@@ -4,25 +4,18 @@ A multi-agent collaborative workspace where a host agent coordinates guest agent
 
 ## Why
 
-Single-agent coding assistants have blind spots. When you ask one agent to design an architecture or plan a migration, you get one perspective — shaped by one model's biases. Salon makes it easy to get multiple independent perspectives on the same problem, have the agents critique each other's proposals, and converge on a better answer through debate.
+Single-agent coding assistants have blind spots. When you ask one agent to design an architecture or plan a migration, you get one perspective — shaped by one model's biases. Multi-agent tools like [Agent Teams](https://code.claude.com/docs/en/agent-teams) help by parallelizing work, but teammates still share the same model and coordinate through free-form messaging.
+
+Salon takes a different approach: it pairs agents from *different* models (Claude Code and Codex CLI) and puts them through a structured debate protocol. Different models err in different directions — Claude tends toward analytical depth, Codex toward engineering rigor — so cross-review between them reliably surfaces blind spots that a single-model team would miss.
 
 Two concrete use cases:
 
-1. **Structured discussion** — Two agents independently explore a design question, cross-review each other's proposals across multiple rounds until they reach consensus (or surface open questions for the user), and the host synthesizes the result.
+1. **Structured discussion** — Two agents independently explore a design question, cross-review each other's proposals across multiple rounds, and the host synthesizes the result.
 2. **Delegated execution** — The host assigns a clear task to a single guest agent while the user continues working. The guest's result is automatically reported back.
-
-### How salon differs from Agent Teams
-
-Claude Code's [Agent Teams](https://code.claude.com/docs/en/agent-teams) is a built-in multi-agent feature where a lead Claude Code session spawns teammate Claude Code sessions that coordinate via a shared task list. Salon takes a different approach:
-
-- **Cross-model collaboration**: Salon coordinates Claude Code *and* Codex CLI in the same session. Different models have genuinely different strengths — Claude tends toward analytical depth, Codex toward engineering rigor. Discussions between them surface perspectives that a single-model team cannot.
-- **Structured debate protocol**: Agent Teams use free-form messaging and a shared task list. Salon's `discuss` tool enforces a specific flow — independent exploration → adversarial cross-review → host synthesis → guest confirmation — designed to extract disagreement rather than converge prematurely.
-- **Host as facilitator, not lead worker**: In Agent Teams, the lead is also a Claude Code instance that assigns tasks and does work. In salon, the host is a distinct role that does not read code or make changes — it frames questions, facilitates discussion, and synthesizes results. This separation prevents the coordinator from anchoring the team's output.
-- **Model-agnostic architecture**: Salon communicates with guests through tmux panes and Unix sockets, not Claude Code internals. Salon uses terminal automation and socket IPC rather than product-specific SDK internals, so it can be extended to other TUI agents with additional runtime and hook integration.
 
 ## How it works
 
-Salon is a [pi](https://github.com/badlogic/pi-mono) extension. The host runs as a pi instance with salon tools; guests are standard Claude Code or Codex CLI processes running in tmux panes within the same session.
+Salon is a [pi](https://github.com/badlogic/pi-mono) extension. It runs inside a tmux session: the host occupies one pane, and each guest agent (Claude Code or Codex CLI) gets its own pane.
 
 ```
 ┌──────────────────────┬──────────────────────┐
@@ -35,23 +28,25 @@ Salon is a [pi](https://github.com/badlogic/pi-mono) extension. The host runs as
       tmux session "salon-<instance>"
 ```
 
-The host communicates with guests by sending messages into their TUI and receiving responses via a Unix socket. Messages are queued until a guest is ready, and long messages are exchanged through files. Guests respond automatically — the host never needs to poll. You can also switch to any guest's pane and interact with them directly.
+The host is a facilitator — it does not read code or make changes directly. It understands the user's intent, chooses which guests to involve, frames questions, facilitates discussion, and synthesizes results. This separation means the coordinator never anchors the team's output with its own implementation bias.
+
+Communication uses terminal automation and socket IPC: the host sends messages into each guest's TUI, and guests respond automatically through a hook that delivers their output back to the host. Messages are queued until a guest is ready, so callers can fire-and-forget immediately after inviting a guest. You can also switch to any guest's pane and interact with them directly — messages without a `[name]:` prefix stay private.
 
 ### Structured discussion
 
-The `discuss` tool orchestrates a multi-round debate between two guests:
+The `discuss` tool orchestrates a multi-round debate between two guests (by default, one Claude Code + one Codex CLI for cross-model perspective):
 
 1. **Explore** — Both guests receive the same question and respond independently.
-2. **Debate** — Each guest reviews the other's proposal. After each round, the host decides: continue debating, move to synthesis, or escalate to the user.
+2. **Debate** — Each guest reviews the other's proposal and gives feedback. After each round, the host decides: continue debating, move to synthesis, or escalate to the user.
 3. **Synthesize** — The host writes a synthesis and submits it to both guests for confirmation.
 
-Cross-review messages use the other guest's name as prefix (`[alice]:`, `[bob]:`), so each guest knows who they're responding to.
+This flow is designed to extract disagreement rather than converge prematurely — guests must engage with the other's reasoning before the host can move on.
 
 ### Guest lifecycle
 
 Guests go through: **spawn** → **ready** → **active** (working/idle) → **dismiss** or **suspend**. Suspended guests retain their session IDs and can be resumed with full conversation history. When the host session restarts, suspended guests are automatically resumed.
 
-The host is a facilitator, not a developer — it does not read code or make changes directly. It frames questions, chooses which guests to involve, facilitates discussion, and synthesizes results.
+Because salon coordinates guests through tmux panes and Unix sockets rather than product-specific internals, it can be extended to other TUI-based coding agents with additional runtime and hook integration.
 
 For implementation details — IPC mechanisms, TUI status detection, state persistence, Codex session association, error handling — see [ARCHITECTURE.md](ARCHITECTURE.md).
 
