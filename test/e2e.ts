@@ -7,7 +7,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync
 import { join } from "node:path";
 import { createServer, type Server } from "node:net";
 import { __test__ as extensionTest } from "../src/extension.ts";
-import { TmuxBackend } from "../src/tmux-backend.ts";
+import { TmuxBackend, TmuxLauncher } from "../src/tmux-backend.ts";
 
 const TMUX_SESSION = "salon-test";
 const SALON_DIR = "/tmp/salon-test";
@@ -336,6 +336,17 @@ console.log("\n== 8. tmux pane management ==");
 	tmux(`kill-session -t "${TMUX_SESSION}"`);
 }
 
+console.log("\n== 8b. TmuxLauncher isolates shell history ==");
+{
+	const launcher = new TmuxLauncher(TMUX_SESSION);
+	launcher.createSession("/tmp");
+
+	const histfile = tmux(`show-environment -t "${TMUX_SESSION}" HISTFILE`);
+	assert("Session HISTFILE is isolated", histfile === "HISTFILE=/dev/null", `got '${histfile}'`);
+
+	tmux(`kill-session -t "${TMUX_SESSION}"`);
+}
+
 console.log("\n== 9. Send keys with submit key ==");
 {
 	tmux(`new-session -d -s "${TMUX_SESSION}" -x 100 -y 30`);
@@ -444,6 +455,7 @@ console.log("\n== 12. Guest wrapper emits ready and exit lifecycle events ==");
 	assert("Wrapper emits guest_ready", script.includes("guest_ready:ready-test"));
 	assert("Wrapper emits guest_ready_timeout", script.includes("guest_ready_timeout:ready-test"));
 	assert("Wrapper emits guest_exited", script.includes("guest_exited:ready-test:$SESSION_ID"));
+	assert("Wrapper isolates HISTFILE", script.includes("export HISTFILE='/dev/null'"));
 }
 
 console.log("\n== 13. Resume summary formatting ==");

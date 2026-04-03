@@ -31,6 +31,7 @@ const TUI_PATTERNS = {
 
 /** Tmux user option storing the salon display name for a pane (used in border labels). */
 const SALON_NAME_OPTION = "@salon_name";
+const SALON_HISTFILE = "/dev/null";
 
 /**
  * grep -E pattern that selects only salon-managed variables from
@@ -311,6 +312,7 @@ export class TmuxBackend implements GuestRuntime {
 			`#!/usr/bin/env bash`,
 			`set -uo pipefail -m`,
 			...(tmuxSession ? [filteredEnvEval(tmuxSession)] : []),
+			`export HISTFILE=${shellQuote(SALON_HISTFILE)}`,
 			`export PATH="$SALON_NODE_BIN:$PATH"`,
 			`export SALON_DIR=${shellQuote(options.salonDir)} SALON_GUEST_NAME=${shellQuote(options.name)}`,
 			`SOCK=${shellQuote(sockPath)}`,
@@ -345,11 +347,11 @@ export class TmuxBackend implements GuestRuntime {
 			`wait "$READY_WATCHER" 2>/dev/null || true`,
 			`SESSION_ID=${shellQuote(options.initialSessionId || "")}`,
 			`if [ -z "$SESSION_ID" ]; then`,
-			`  CAPTURED=$(tmux capture-pane -t "$TMUX_PANE" -p -S -20 2>/dev/null || true)`,
+			`  CAPTURED=$(tmux capture-pane -t "$TMUX_PANE" -p -J -S -20 2>/dev/null || true)`,
 			`  SESSION_ID=$(echo "$CAPTURED" | grep -o 'claude --resume [^ ]*' | tail -1 | awk '{print $3}')`,
 			`fi`,
 			`if [ -z "$SESSION_ID" ]; then`,
-			`  CAPTURED=$(tmux capture-pane -t "$TMUX_PANE" -p -S -20 2>/dev/null || true)`,
+			`  CAPTURED=$(tmux capture-pane -t "$TMUX_PANE" -p -J -S -20 2>/dev/null || true)`,
 			`  SESSION_ID=$(echo "$CAPTURED" | grep -o 'codex resume [^ ]*' | tail -1 | awk '{print $3}')`,
 			`fi`,
 			`send_system_event "guest_exited:${options.name}:$SESSION_ID"`,
@@ -398,6 +400,9 @@ export class TmuxLauncher implements SalonLauncher {
 				nonInteractiveBashCommand("exec tail -f /dev/null"),
 			]);
 		}
+		// Keep salon-managed shells from appending commands to the user's normal
+		// shell history when agents execute inside tmux panes.
+		this.tmuxCommand(["set-environment", "-t", this.tmuxSession, "HISTFILE", SALON_HISTFILE]);
 		this.tmuxCommand(["set-option", "-t", this.tmuxSession, "-g", "mouse", "on"]);
 		this.tmuxCommand(["set-option", "-t", this.tmuxSession, "-g", "extended-keys", "always"]);
 		this.tmuxCommand(["set-option", "-t", this.tmuxSession, "-g", "extended-keys-format", "csi-u"]);
@@ -428,7 +433,7 @@ export class TmuxLauncher implements SalonLauncher {
 
 	launchHost(command: string): void {
 		const hostPane = `${this.tmuxSession}:0.0`;
-		const envSetup = `${filteredEnvEval(this.tmuxSession)} && export PATH="$SALON_NODE_BIN:$PATH"`;
+		const envSetup = `${filteredEnvEval(this.tmuxSession)} && export HISTFILE=${shellQuote(SALON_HISTFILE)} && export PATH="$SALON_NODE_BIN:$PATH"`;
 		// Replace the placeholder process with the host directly, again avoiding
 		// any interactive shell startup output in the pane.
 		const launchCommand = nonInteractiveBashCommand(`${envSetup} && exec ${command}`);
