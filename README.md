@@ -53,11 +53,16 @@ For implementation details — IPC mechanisms, TUI status detection, state persi
 ## Usage
 
 ```bash
-npm install
-npm start [working-directory]
+# Install globally (once)
+npm install && npm link    # or: npm install -g .
+
+# Launch
+salon [working-directory]
 ```
 
-This creates a tmux session, installs hooks (idempotently) for Claude Code and Codex CLI, and launches the host. Inside the host:
+`npm install` registers hooks (idempotently) for Claude Code and Codex CLI. `salon` creates a tmux session and launches the host. If working inside the repo without a global install, `npm start -- [working-directory]` works as well.
+
+Inside the host:
 
 - Talk naturally — the host decides when to involve guests
 - `/discuss <topic>` — explicitly start a structured discussion

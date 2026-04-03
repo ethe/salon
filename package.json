@@ -2,6 +2,9 @@
   "name": "salon",
   "version": "0.1.0",
   "private": true,
+  "bin": {
+    "salon": "./bin/salon"
+  },
   "type": "module",
   "scripts": {
     "start": "tsx src/main.ts",
@@ -11,12 +14,12 @@
     "build": "tsc"
   },
   "dependencies": {
-    "@mariozechner/pi-coding-agent": "^0.62.0",
-    "@sinclair/typebox": "^0.34.0"
+    "@mariozechner/pi-coding-agent": "^0.64.0",
+    "@sinclair/typebox": "^0.34.0",
+    "tsx": "^4.20.3"
   },
   "devDependencies": {
     "@types/node": "^22.10.5",
-    "tsx": "^4.20.3",
     "typescript": "^5.9.2"
   }
 }

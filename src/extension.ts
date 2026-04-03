@@ -28,7 +28,7 @@ import {
 	buildSummary as buildDiscussionSummary,
 } from "./discussion.js";
 
-const SALON_INSTANCE = process.env.SALON_INSTANCE || "default";
+const SALON_INSTANCE = process.env.SALON_INSTANCE || `default-${randomUUID().slice(0, 8)}`;
 const TMUX_SESSION = process.env.SALON_TMUX_SESSION || `salon-${SALON_INSTANCE}`;
 const SALON_STATE_ENTRY_TYPE = "salon_state";
 const SALON_STATE_VERSION = 1;
@@ -144,6 +144,33 @@ interface MessageContext {
 	getMsgFileCounter: () => number;
 	incMsgFileCounter: () => number;
 	msgLengthThreshold: number;
+	incForwardTicketCounter?: () => number;
+}
+
+const FORWARD_TICKET_PREFIX = "ticket-";
+const FORWARD_ARMED_MARKER = "armed";
+
+function getGuestForwardDir(salonDir: string, guestName: string): string {
+	return join(salonDir, "forward", sanitizeGuestName(guestName));
+}
+
+function getGuestForwardArmedPath(salonDir: string, guestName: string): string {
+	return join(getGuestForwardDir(salonDir, guestName), FORWARD_ARMED_MARKER);
+}
+
+function createGuestForwardTicket(salonDir: string, guestName: string, ticketId?: number): string {
+	const forwardDir = getGuestForwardDir(salonDir, guestName);
+	mkdirSync(forwardDir, { recursive: true });
+	const suffix = ticketId !== undefined
+		? String(ticketId).padStart(12, "0")
+		: `${Date.now()}-${randomUUID().slice(0, 8)}`;
+	const ticketPath = join(forwardDir, `${FORWARD_TICKET_PREFIX}${suffix}`);
+	writeFileSync(ticketPath, "");
+	return ticketPath;
+}
+
+function clearGuestForwardState(salonDir: string, guestName: string) {
+	rmSync(getGuestForwardDir(salonDir, guestName), { recursive: true, force: true });
 }
 
 function sayToGuestImpl(ctx: MessageContext, guest: Guest, message: string, from = "host"): "queued" | "sent" {
@@ -156,14 +183,22 @@ function sayToGuestImpl(ctx: MessageContext, guest: Guest, message: string, from
 
 	guest.eventStatus = "working";
 	const prefix = `[${from}]: `;
+	let outboundMessage: string;
 	if (message.length <= ctx.msgLengthThreshold) {
-		ctx.runtime.send(guest.runtimeId, `${prefix}${message}`);
+		outboundMessage = `${prefix}${message}`;
 	} else {
 		const exchangeDir = join(ctx.salonDir, "exchange");
 		mkdirSync(exchangeDir, { recursive: true });
 		const msgFile = join(exchangeDir, `${ctx.incMsgFileCounter()}_${safeLabelForFilename(from)}.md`);
 		writeFileSync(msgFile, message);
-		ctx.runtime.send(guest.runtimeId, `${prefix}Read ${msgFile} and respond.`);
+		outboundMessage = `${prefix}Read ${msgFile} and respond.`;
+	}
+	const ticketPath = createGuestForwardTicket(ctx.salonDir, guest.name, ctx.incForwardTicketCounter?.());
+	try {
+		ctx.runtime.send(guest.runtimeId, outboundMessage);
+	} catch (error) {
+		rmSync(ticketPath, { force: true });
+		throw error;
 	}
 	return "sent" as const;
 }
@@ -583,12 +618,14 @@ export default function salonExtension(pi: ExtensionAPI) {
 	mkdirSync(guestDir, { recursive: true });
 
 	let msgFileCounter = 0;
+	let forwardTicketCounter = 0;
 	const msgCtx: MessageContext = {
 		runtime,
 		salonDir,
 		getMsgFileCounter: () => msgFileCounter,
 		incMsgFileCounter: () => ++msgFileCounter,
 		msgLengthThreshold: 2000,
+		incForwardTicketCounter: () => ++forwardTicketCounter,
 	};
 	let pendingResumeSummary: string | undefined;
 
@@ -703,6 +740,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 		options: { dropDismissedRecord?: boolean; reactivateArchivedDiscussions?: boolean; persist?: boolean } = {},
 	): Guest {
 		cancelCodexSessionScan(guest.name);
+		clearGuestForwardState(salonDir, guest.name);
 		guests.set(guest.name, guest);
 		if (options.dropDismissedRecord) {
 			dismissedGuests.delete(guest.name);
@@ -740,6 +778,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 		// which provides the authoritative session ID. Let guest_exited (or the
 		// teardown-timeout path in transitionGuestToInactive) handle it.
 		cancelCodexSessionScan(guest.name);
+		clearGuestForwardState(salonDir, guest.name);
 		guest.lifecycleStatus = "dismissing";
 		removeGuestFromDiscussion(guest.name);
 		writeGuestRuntimeFile(guest);
@@ -758,6 +797,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 		const activeGuest = guests.get(name);
 		if (activeGuest) {
 			cancelCodexSessionScan(name);
+			clearGuestForwardState(salonDir, name);
 			trackGuestSessionId(activeGuest, sessionId, { writeRuntimeFile: false, force: !!sessionId });
 			const droppedQueuedCount = queuedGuestMessages.get(name)?.length || 0;
 			if (runtimeFileMode === "always" || activeGuest.sessionId) {
@@ -782,6 +822,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 			return { transitionedFromActive: false, droppedQueuedCount: 0 };
 		}
 		cancelCodexSessionScan(name);
+		clearGuestForwardState(salonDir, name);
 		trackGuestSessionId(inactiveRecord, sessionId, { writeRuntimeFile: false, force: !!sessionId });
 		if (persist) {
 			persistSalonState();
@@ -935,6 +976,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 
 	function clearRuntimeState() {
 		pendingResumeSummary = undefined;
+		forwardTicketCounter = 0;
 		for (const timer of activeCodexSessionScans.values()) {
 			clearTimeout(timer);
 		}
@@ -1724,6 +1766,10 @@ When delegating execution tasks (invite_guest + say_to_guest, implementation wor
 - After invite_guest, send the first message immediately when you know the task. Do not wait for a ready notification — messages queue and flush automatically when startup completes.
 - A guest receiving an execution task should understand the full intent, not just a list of file changes.
 
+When relaying a guest's words (to the user or to another guest):
+- Quote or preserve the original expression faithfully. Do not rephrase, summarize, or rewrite it.
+- You may add your own commentary, intent, or framing around the quote, but keep the guest's own words intact.
+
 When facilitating discussion:
 - Ask open-ended questions that draw out deeper thinking, not yes/no questions
 - Challenge assumptions — "what if the codebase grows 10x?" or "what are you not considering?"
@@ -2005,6 +2051,10 @@ export const __test__ = {
 	formatRecoveredSalonSummary,
 	sanitizeGuestName,
 	inviteGuest,
+	getGuestForwardDir,
+	getGuestForwardArmedPath,
+	createGuestForwardTicket,
+	clearGuestForwardState,
 	sayToGuestImpl,
 	flushQueuedGuestMessagesImpl,
 	startMessageServer,

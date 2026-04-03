@@ -35,11 +35,12 @@ const SALON_NAME_OPTION = "@salon_name";
 /**
  * grep -E pattern that selects only salon-managed variables from
  * `tmux show-environment -s` output, preventing unrelated inherited
- * variables (e.g. npm_config_prefix) from leaking into pane shells.
+ * variables (e.g. npm_config_prefix) from leaking into pane shells while
+ * keeping terminal capability metadata that host/guest TUIs depend on.
  *
  * Must stay in sync with the keys set by buildEnvironment() in main.ts.
  */
-const SALON_ENV_FILTER = "^(SALON_|ANTHROPIC_API_KEY=|OPENAI_API_KEY=|https?_proxy=|HTTPS?_PROXY=|no_proxy=|NO_PROXY=|ALL_PROXY=|all_proxy=)";
+const SALON_ENV_FILTER = "^(SALON_|ANTHROPIC_API_KEY=|OPENAI_API_KEY=|https?_proxy=|HTTPS?_PROXY=|no_proxy=|NO_PROXY=|ALL_PROXY=|all_proxy=|COLORTERM=|TERM_PROGRAM=|TERM_PROGRAM_VERSION=|KITTY_WINDOW_ID=|GHOSTTY_RESOURCES_DIR=|WEZTERM_PANE=|ITERM_SESSION_ID=|WT_SESSION=|LC_TERMINAL=|LC_TERMINAL_VERSION=)";
 
 /** Build a shell snippet that evals only salon-managed env vars from the tmux session. */
 function filteredEnvEval(tmuxSession: string): string {
@@ -388,7 +389,7 @@ export class TmuxLauncher implements SalonLauncher {
 			]);
 		}
 		this.tmuxCommand(["set-option", "-t", this.tmuxSession, "-g", "mouse", "on"]);
-		this.tmuxCommand(["set-option", "-t", this.tmuxSession, "-g", "extended-keys", "on"]);
+		this.tmuxCommand(["set-option", "-t", this.tmuxSession, "-g", "extended-keys", "always"]);
 		this.tmuxCommand(["set-option", "-t", this.tmuxSession, "-g", "extended-keys-format", "csi-u"]);
 		this.tmuxCommand(["set-option", "-t", this.tmuxSession, "pane-border-status", "top"]);
 		this.tmuxCommand(["set-option", "-t", this.tmuxSession, "pane-border-format", ` #{${SALON_NAME_OPTION}} `]);

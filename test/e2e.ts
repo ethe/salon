@@ -390,10 +390,16 @@ console.log("\n== 10. Guest termination uses correct exit commands ==");
 console.log("\n== 11. Environment variable forwarding ==");
 {
 	const envVars = ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "no_proxy",
-		"NO_PROXY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "ALL_PROXY", "all_proxy"];
+		"NO_PROXY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "ALL_PROXY", "all_proxy",
+		"COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "KITTY_WINDOW_ID",
+		"GHOSTTY_RESOURCES_DIR", "WEZTERM_PANE", "ITERM_SESSION_ID", "WT_SESSION",
+		"LC_TERMINAL", "LC_TERMINAL_VERSION"];
 
 	for (const v of ["http_proxy", "ANTHROPIC_API_KEY"]) {
 		assert(`${v} in forward list`, envVars.includes(v));
+	}
+	for (const v of ["TERM_PROGRAM", "COLORTERM", "GHOSTTY_RESOURCES_DIR"]) {
+		assert(`${v} terminal hint forwarded`, envVars.includes(v));
 	}
 }
 
@@ -641,6 +647,28 @@ console.log("\n== 17. invite_guest + sayToGuest(initial_message) → queue → f
 	guests.delete("invite-test");
 	queuedGuestMessages.clear();
 	extensionTest.clearGuestForwardState(SALON_DIR, "invite-test");
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// == 18. generateSalonInstance determinism ==
+{
+	const { generateSalonInstance } = await import("../src/instance.ts");
+	console.log(`\n== 18. generateSalonInstance determinism ==`);
+
+	const a1 = generateSalonInstance("/Users/test/my-project");
+	const a2 = generateSalonInstance("/Users/test/my-project");
+	assert("Same workDir produces same instance ID", a1 === a2);
+
+	const b1 = generateSalonInstance("/Users/test/other-project");
+	assert("Different workDir produces different instance ID", a1 !== b1);
+
+	assert("Instance starts with slug of basename", a1.startsWith("my-project-"));
+	assert("Instance has 8-char hex suffix", /^[a-z0-9-]+-[0-9a-f]{8}$/.test(a1));
+
+	// Edge case: paths with same basename but different parents
+	const c1 = generateSalonInstance("/home/alice/repo");
+	const c2 = generateSalonInstance("/home/bob/repo");
+	assert("Same basename, different parent → different ID", c1 !== c2);
 }
 
 // ══════════════════════════════════════════════════════════════════════

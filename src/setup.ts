@@ -11,52 +11,86 @@ import { join, resolve } from "node:path";
 const SCRIPT_DIR = resolve(import.meta.dirname, "..");
 const hookPath = join(SCRIPT_DIR, "hooks", "agent-response.sh");
 
-// Claude Code: Stop hook in ~/.claude/settings.json
+type ClaudeHook = { type?: string; command?: string };
+type ClaudeHookEntry = { matcher?: string; hooks?: ClaudeHook[] };
+type ClaudeSettings = {
+	hooks?: Record<string, ClaudeHookEntry[]>;
+	[key: string]: unknown;
+};
+
+function makeClaudeHookEntry(): ClaudeHookEntry {
+	return { matcher: "", hooks: [{ type: "command", command: hookPath }] };
+}
+
+function normalizeClaudeHookEntries(entries: ClaudeHookEntry[] | undefined, eventName: "Stop" | "UserPromptSubmit") {
+	const normalizedEntries = Array.isArray(entries) ? entries : [];
+	let hasCurrentHook = false;
+	let changed = !Array.isArray(entries);
+
+	for (const entry of normalizedEntries) {
+		if (!Array.isArray(entry.hooks)) continue;
+		for (let i = 0; i < entry.hooks.length; i++) {
+			const hook = entry.hooks[i];
+			const command = hook.command;
+			if (!command) continue;
+			if (eventName === "Stop" && (command.includes("claude-stop.sh") || command.includes("planner-stop.sh"))) {
+				entry.hooks.splice(i, 1);
+				i--;
+				changed = true;
+				continue;
+			}
+			if (command === hookPath || command.includes("agent-response.sh")) {
+				if (!hasCurrentHook) {
+					hasCurrentHook = true;
+					if (command !== hookPath || hook.type !== "command") {
+						entry.hooks[i] = { type: "command", command: hookPath };
+						changed = true;
+					}
+				} else {
+					entry.hooks.splice(i, 1);
+					i--;
+					changed = true;
+				}
+			}
+		}
+	}
+
+	if (!hasCurrentHook) {
+		normalizedEntries.push(makeClaudeHookEntry());
+		changed = true;
+	}
+
+	return { entries: normalizedEntries, changed };
+}
+
+// Claude Code: Stop + UserPromptSubmit hooks in ~/.claude/settings.json
 (() => {
 	const settingsDir = join(process.env.HOME!, ".claude");
 	const settingsFile = join(settingsDir, "settings.json");
 	mkdirSync(settingsDir, { recursive: true });
 
-	const makeEntry = () => ({ matcher: "", hooks: [{ type: "command", command: hookPath }] });
-
 	if (existsSync(settingsFile)) {
-		const settings = JSON.parse(readFileSync(settingsFile, "utf-8"));
-		const stopHooks: Array<{ hooks?: Array<{ type?: string; command?: string }> }> = settings.hooks?.Stop || [];
+		const settings = JSON.parse(readFileSync(settingsFile, "utf-8")) as ClaudeSettings;
+		settings.hooks = settings.hooks || {};
 
-		// Check if already up-to-date
-		if (stopHooks.some((e) => e.hooks?.some((h) => h.command === hookPath))) return;
+		const normalizedStop = normalizeClaudeHookEntries(settings.hooks.Stop, "Stop");
+		const normalizedPromptSubmit = normalizeClaudeHookEntries(settings.hooks.UserPromptSubmit, "UserPromptSubmit");
 
-		// Replace stale entry if present, otherwise append
-		let replaced = false;
-		for (const entry of stopHooks) {
-			if (!entry.hooks) continue;
-			for (let i = 0; i < entry.hooks.length; i++) {
-				if (entry.hooks[i].command?.includes("agent-response.sh")) {
-					entry.hooks[i] = { type: "command", command: hookPath };
-					replaced = true;
-				}
-			}
-		}
+		if (!normalizedStop.changed && !normalizedPromptSubmit.changed) return;
 
-		// Remove legacy hooks
-		for (const entry of stopHooks) {
-			if (!entry.hooks) continue;
-			entry.hooks = entry.hooks.filter((h) =>
-				!h.command?.includes("claude-stop.sh") && !h.command?.includes("planner-stop.sh"));
-		}
-
-		if (!replaced) {
-			settings.hooks = settings.hooks || {};
-			settings.hooks.Stop = settings.hooks.Stop || [];
-			settings.hooks.Stop.push(makeEntry());
-		}
-
+		settings.hooks.Stop = normalizedStop.entries;
+		settings.hooks.UserPromptSubmit = normalizedPromptSubmit.entries;
 		writeFileSync(settingsFile, JSON.stringify(settings, null, 2));
 	} else {
-		writeFileSync(settingsFile, JSON.stringify({ hooks: { Stop: [makeEntry()] } }, null, 2));
+		writeFileSync(settingsFile, JSON.stringify({
+			hooks: {
+				Stop: [makeClaudeHookEntry()],
+				UserPromptSubmit: [makeClaudeHookEntry()],
+			},
+		}, null, 2));
 	}
 
-	console.log("salon: Claude Code Stop hook installed");
+	console.log("salon: Claude Code Stop/UserPromptSubmit hooks installed");
 })();
 
 // Codex CLI: notify in ~/.codex/config.toml

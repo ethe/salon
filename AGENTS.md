@@ -2,6 +2,10 @@
 
 This file is for AI agents contributing to this repository. For product overview, architecture, workflow, and user-facing usage, see `README.md` and `ARCHITECTURE.md`.
 
+## Project phase
+
+This project is in **Proof of Concept** stage. Breaking changes are welcome — there is no stable API or backwards-compatibility guarantee. Prioritize correctness and simplicity over migration paths.
+
 ## Core commands
 
 ```bash

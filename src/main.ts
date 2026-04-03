@@ -1,28 +1,16 @@
-import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
-import { createInterface } from "node:readline";
 import type { SalonLauncher } from "./runtime.js";
 import { TmuxLauncher } from "./tmux-backend.js";
+import { generateSalonInstance } from "./instance.js";
 
 const SCRIPT_DIR = resolve(import.meta.dirname, "..");
 const WORK_DIR = process.argv[2] ? resolve(process.argv[2]) : process.cwd();
-const SALON_INSTANCE = process.env.SALON_INSTANCE || deriveSalonInstance(WORK_DIR);
+const SALON_INSTANCE = process.env.SALON_INSTANCE || generateSalonInstance(WORK_DIR);
 const SALON_DIR = process.env.SALON_DIR || join(process.env.HOME!, ".salon", SALON_INSTANCE);
 const HOST_SESSION_DIR = join(SALON_DIR, "host-sessions");
 const TMUX_SESSION = process.env.SALON_TMUX_SESSION || `salon-${SALON_INSTANCE}`;
-
-type ExistingSessionAction = "kill" | "attach";
-
-function deriveSalonInstance(workDir: string): string {
-	const base = basename(workDir) || "workspace";
-	const slug = base
-		.toLowerCase()
-		.replace(/[^a-z0-9]+/g, "-")
-		.replace(/^-+|-+$/g, "") || "workspace";
-	const hash = createHash("sha1").update(workDir).digest("hex").slice(0, 8);
-	return `${slug}-${hash}`;
-}
 
 function shellQuote(value: string): string {
 	return `'${value.replace(/'/g, `'\\''`)}'`;
@@ -32,20 +20,16 @@ function joinShellArgs(args: string[]): string {
 	return args.map(shellQuote).join(" ");
 }
 
-function prompt(question: string): Promise<string> {
-	const rl = createInterface({ input: process.stdin, output: process.stdout });
-	return new Promise((resolvePrompt) => {
-		rl.question(question, (answer) => {
-			rl.close();
-			resolvePrompt(answer.trim());
-		});
-	});
-}
-
-async function chooseExistingSessionAction(): Promise<ExistingSessionAction> {
-	const answer = (await prompt(`Session '${TMUX_SESSION}' exists. [k]ill / [a]ttach? [a] `)).toLowerCase();
-	if (answer === "k" || answer === "kill") return "kill";
-	return "attach";
+function listExistingSalonSessions(): string[] {
+	try {
+		const output = execFileSync("tmux", ["list-sessions", "-F", "#{session_name}"], {
+			encoding: "utf-8",
+			stdio: ["pipe", "pipe", "pipe"],
+		}).trim();
+		return output.split("\n").filter(name => name.startsWith("salon-"));
+	} catch {
+		return [];
+	}
 }
 
 function buildEnvironment(): Record<string, string> {
@@ -54,6 +38,12 @@ function buildEnvironment(): Record<string, string> {
 	for (const key of [
 		"http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "no_proxy", "NO_PROXY",
 		"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "ALL_PROXY", "all_proxy",
+		// Preserve terminal capability hints needed by TUIs for keyboard/image/color support.
+		// Intentionally do NOT forward TERM itself here; inside tmux it should remain the
+		// tmux-provided value (for example tmux-256color), not the outer terminal's TERM.
+		"COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION",
+		"KITTY_WINDOW_ID", "GHOSTTY_RESOURCES_DIR", "WEZTERM_PANE",
+		"ITERM_SESSION_ID", "WT_SESSION", "LC_TERMINAL", "LC_TERMINAL_VERSION",
 	]) {
 		if (process.env[key]) vars[key] = process.env[key]!;
 	}
@@ -83,17 +73,13 @@ try {
 mkdirSync(join(SALON_DIR, "guests"), { recursive: true });
 mkdirSync(HOST_SESSION_DIR, { recursive: true });
 
-if (launcher.sessionExists()) {
-	const action = await chooseExistingSessionAction();
-	if (action === "attach") {
-		try {
-			launcher.attach();
-		} catch {
-			// session exited while attaching; just exit.
-		}
-		process.exit(0);
+const existing = listExistingSalonSessions();
+if (existing.length > 0) {
+	console.log(`Existing salon sessions (reattach with tmux attach -t <name>):`);
+	for (const name of existing) {
+		console.log(`  ${name}`);
 	}
-	launcher.destroySession();
+	console.log("");
 }
 
 launcher.createSession(WORK_DIR);
