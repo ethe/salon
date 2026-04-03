@@ -101,12 +101,121 @@ const claimedSessionIds = new Set<string>();
 const activeCodexSessionScans = new Map<string, ReturnType<typeof setTimeout>>();
 const queuedGuestMessages = new Map<string, Array<{ message: string; from: string }>>();
 const guestExitWaiters = new Map<string, Deferred<void>>();
+const usedGuestNames = new Set<string>();
+const usedGuestPoolNames = new Set<string>();
+const guestNameOrdinals = new Map<string, number>();
 
 const CODEX_SESSION_SCAN_INITIAL_DELAY_MS = 2000;
 const CODEX_SESSION_SCAN_INTERVAL_MS = 2000;
 const CODEX_SESSION_SCAN_TIMEOUT_MS = 30000;
 const CODEX_SESSION_SCAN_MAX_FIRST_LINE_BYTES = 16 * 1024;
 const SOCKET_PROBE_TIMEOUT_MS = 250;
+const GUEST_NAME_POOL = [
+	"Euclid",
+	"Pythagoras",
+	"Democritus",
+	"Socrates",
+	"Plato",
+	"Aristotle",
+	"Epicurus",
+	"Epictetus",
+	"Hypatia",
+	"Archimedes",
+	"Ptolemy",
+	"Avicenna",
+	"Averroes",
+	"Ockham",
+	"Copernicus",
+	"Vesalius",
+	"Bacon",
+	"Galileo",
+	"Kepler",
+	"Descartes",
+	"Hobbes",
+	"Pascal",
+	"Boyle",
+	"Hooke",
+	"Leibniz",
+	"Newton",
+	"Locke",
+	"Huygens",
+	"Halley",
+	"Bernoulli",
+	"Euler",
+	"Linnaeus",
+	"Hume",
+	"Rousseau",
+	"Lagrange",
+	"Kant",
+	"Laplace",
+	"Volta",
+	"Young",
+	"Faraday",
+	"Gauss",
+	"Darwin",
+	"Babbage",
+	"Somerville",
+	"Maxwell",
+	"Curie",
+	"Boltzmann",
+	"Pasteur",
+	"Mendel",
+	"Kierkegaard",
+	"Nightingale",
+	"Helmholtz",
+	"Mach",
+	"Nietzsche",
+	"Poincare",
+	"Planck",
+	"Peirce",
+	"Dewey",
+	"Freud",
+	"Pavlov",
+	"Raman",
+	"Ramanujan",
+	"Hilbert",
+	"Noether",
+	"Russell",
+	"Wittgenstein",
+	"Einstein",
+	"Bohr",
+	"Heisenberg",
+	"Schrodinger",
+	"Hubble",
+	"Godel",
+	"Turing",
+	"Popper",
+	"Carson",
+	"Hopper",
+	"Bell",
+	"Neumann",
+	"Feynman",
+	"Salk",
+	"McClintock",
+	"Franklin",
+	"Goodall",
+	"Sagan",
+	"Hawking",
+	"Mandelbrot",
+	"Nash",
+	"Kahneman",
+	"Ostrom",
+	"Arendt",
+	"Beauvoir",
+	"Sartre",
+	"Rawls",
+	"Quine",
+	"Chomsky",
+	"BernersLee",
+	"Lovelace",
+	"Shannon",
+	"Meitner",
+	"Dirac",
+	"Pauli",
+	"Crick",
+	"Watson",
+] as const;
+const GUEST_NAME_POOL_SET = new Set<string>(GUEST_NAME_POOL);
 
 function shellQuote(value: string): string {
 	return `'${value.replace(/'/g, `'\\''`)}'`;
@@ -128,6 +237,54 @@ function sanitizeGuestName(name: string): string {
 	if (!/^[A-Za-z0-9._-]+$/.test(name)) {
 		throw new Error(`Invalid guest name '${name}'. Use only letters, numbers, dot, underscore, or dash.`);
 	}
+	return name;
+}
+
+function getGeneratedGuestNameBase(name: string): string | undefined {
+	if (GUEST_NAME_POOL_SET.has(name)) return name;
+	const match = /^([A-Za-z0-9._-]+)-(\d+)$/.exec(name);
+	if (!match) return undefined;
+	return GUEST_NAME_POOL_SET.has(match[1]) ? match[1] : undefined;
+}
+
+function trackGuestNameUsage(name: string) {
+	name = sanitizeGuestName(name);
+	usedGuestNames.add(name);
+	const baseName = getGeneratedGuestNameBase(name);
+	if (!baseName) return;
+	usedGuestPoolNames.add(baseName);
+	const currentNextOrdinal = guestNameOrdinals.get(baseName) || 2;
+	let nextOrdinal = 2;
+	if (name !== baseName && name.startsWith(`${baseName}-`)) {
+		const ordinal = Number(name.slice(baseName.length + 1));
+		if (Number.isInteger(ordinal) && ordinal > 0) {
+			nextOrdinal = Math.max(2, ordinal + 1);
+		}
+	}
+	guestNameOrdinals.set(baseName, Math.max(currentNextOrdinal, nextOrdinal));
+}
+
+function generateGuestName(): string {
+	const unusedBaseNames = GUEST_NAME_POOL.filter((name) =>
+		!usedGuestPoolNames.has(name) &&
+		!guests.has(name) &&
+		!dismissedGuests.has(name),
+	);
+	if (unusedBaseNames.length > 0) {
+		const name = unusedBaseNames[Math.floor(Math.random() * unusedBaseNames.length)];
+		trackGuestNameUsage(name);
+		return name;
+	}
+
+	const baseName = GUEST_NAME_POOL[Math.floor(Math.random() * GUEST_NAME_POOL.length)];
+	let ordinal = guestNameOrdinals.get(baseName) || 2;
+	let name = `${baseName}-${ordinal}`;
+	while (usedGuestNames.has(name) || guests.has(name) || dismissedGuests.has(name)) {
+		ordinal += 1;
+		name = `${baseName}-${ordinal}`;
+	}
+	guestNameOrdinals.set(baseName, ordinal + 1);
+	trackGuestNameUsage(name);
 	return name;
 }
 
@@ -332,8 +489,9 @@ function createCodexGuestNonce(): string {
 	return `SALON_NONCE:${randomUUID().replace(/-/g, "").slice(0, 8)}`;
 }
 
-function buildGuestInstructions(nonce?: string): string {
-	return nonce ? `${GUEST_INSTRUCTIONS}\n\n${nonce}` : GUEST_INSTRUCTIONS;
+function buildGuestInstructions(name: string, nonce?: string): string {
+	const base = `Your name in this salon is ${name}.\n\n${GUEST_INSTRUCTIONS}`;
+	return nonce ? `${base}\n\n${nonce}` : base;
 }
 
 function normalizePath(path: string): string {
@@ -549,21 +707,28 @@ function formatRecoveredSalonSummary(input: RecoveredSalonSummaryInput): string 
 }
 
 // ── Invite a guest (shared logic) ─────────────────────────────────────
+function ensureGuestNameAvailable(name: string): string {
+	name = sanitizeGuestName(name);
+	if (guests.has(name) || dismissedGuests.has(name)) {
+		throw new Error(`Guest '${name}' is already in the salon`);
+	}
+	return name;
+}
+
 function inviteGuest(
-	name: string,
+	name: string | undefined,
 	type: GuestType,
 	workDir: string,
 	salonDir: string,
 	guestDir: string,
 	runtime: GuestRuntime,
 ): Guest {
-	name = sanitizeGuestName(name);
-	if (guests.has(name)) throw new Error(`Guest '${name}' is already in the salon`);
+	name = ensureGuestNameAvailable(name ? name : generateGuestName());
 
 	const sessionId = type === "claude" ? randomUUID() : undefined;
 	const nonce = type === "codex" ? createCodexGuestNonce() : undefined;
 
-	const instructions = buildGuestInstructions(nonce);
+	const instructions = buildGuestInstructions(name, nonce);
 	const instructionsFile = join(guestDir, `${name}.instructions`);
 	writeFileSync(instructionsFile, instructions);
 
@@ -741,6 +906,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 	): Guest {
 		cancelCodexSessionScan(guest.name);
 		clearGuestForwardState(salonDir, guest.name);
+		trackGuestNameUsage(guest.name);
 		guests.set(guest.name, guest);
 		if (options.dropDismissedRecord) {
 			dismissedGuests.delete(guest.name);
@@ -992,6 +1158,9 @@ export default function salonExtension(pi: ExtensionAPI) {
 		activeCodexSessionScans.clear();
 		queuedGuestMessages.clear();
 		guestExitWaiters.clear();
+		usedGuestNames.clear();
+		usedGuestPoolNames.clear();
+		guestNameOrdinals.clear();
 	}
 
 	function restoreMsgFileCounter() {
@@ -1038,6 +1207,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 				workspaceDir: runtimeGuest?.workspaceDir || persistedGuest.workspaceDir || workDir,
 			};
 
+			trackGuestNameUsage(record.name);
 			dismissedGuests.set(record.name, record);
 		}
 
@@ -1247,7 +1417,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 		const instructionsFile = join(guestDir, `${name}.instructions`);
 		// Instructions file should still exist from the original invite
 		if (!existsSync(instructionsFile)) {
-			writeFileSync(instructionsFile, buildGuestInstructions(dismissed.nonce));
+			writeFileSync(instructionsFile, buildGuestInstructions(name, dismissed.nonce));
 		}
 
 		let cmd: string;
@@ -1328,11 +1498,13 @@ export default function salonExtension(pi: ExtensionAPI) {
 			"Invite a guest agent (Claude Code or Codex CLI) to the salon. " +
 			"Use 'claude' for analysis, planning, code review, research, discussion. " +
 			"Use 'codex' for code generation, making edits, executing changes. " +
+			"Salon auto-generates a human-friendly guest name. " +
 			"After inviting, you may call say_to_guest immediately — if startup is still in progress, delivery is queued automatically.",
 		promptSnippet: "Invite a Claude Code or Codex CLI guest to the salon",
 		promptGuidelines: [
 			"Invite 'claude' for analysis, planning, code review, research, discussion",
 			"Invite 'codex' for code generation, edits, implementations",
+			"Guest names are assigned automatically from the salon name pool",
 			"After invite_guest, you can say_to_guest immediately — do not wait for a ready notification because delivery queues automatically",
 			"Use initial_message when you already know the first task to delegate",
 			"Don't invite guests for simple questions you can answer directly",
@@ -1340,13 +1512,12 @@ export default function salonExtension(pi: ExtensionAPI) {
 		],
 		parameters: Type.Object({
 			type: Type.Union([Type.Literal("claude"), Type.Literal("codex")], { description: "Guest type" }),
-			name: Type.String({ description: "Unique guest name, e.g. 'researcher', 'reviewer'" }),
 			initial_message: Type.Optional(Type.String({
 				description: "Optional first message to send immediately after inviting. If the guest is still starting up, it will be queued automatically.",
 			})),
 		}),
 		async execute(_id, params: any) {
-			const guest = activateGuestLifecycle(inviteGuest(params.name, params.type, workDir, salonDir, guestDir, runtime));
+			const guest = activateGuestLifecycle(inviteGuest(undefined, params.type, workDir, salonDir, guestDir, runtime));
 			scanCodexSessionId(guest);
 			const initialMessageStatus = params.initial_message !== undefined
 				? sayToGuest(guest, params.initial_message)
@@ -1354,13 +1525,13 @@ export default function salonExtension(pi: ExtensionAPI) {
 			persistSalonState();
 
 			const parts = [
-				`Invited ${params.type} guest '${params.name}' to the salon.`,
+				`Invited ${params.type} guest '${guest.name}' to the salon.`,
 				"You may call say_to_guest immediately — do not wait for a ready notification; messages queue automatically until startup completes.",
 			];
 			if (initialMessageStatus === "sent") {
-				parts.push(`Initial message sent to '${params.name}'.`);
+				parts.push(`Initial message sent to '${guest.name}'.`);
 			} else if (initialMessageStatus === "queued") {
-				parts.push(`Initial message queued for '${params.name}'; it will be delivered automatically when startup completes.`);
+				parts.push(`Initial message queued for '${guest.name}'; it will be delivered automatically when startup completes.`);
 			}
 
 			return {
@@ -1399,14 +1570,28 @@ export default function salonExtension(pi: ExtensionAPI) {
 			const typeA = params.guest_a_type || "claude";
 			const typeB = params.guest_b_type || "codex";
 			const discId = `disc_${Date.now()}`;
-			const nameA = params.guest_a_name || `${discId}_a`;
-			const nameB = params.guest_b_name || `${discId}_b`;
 
 			// Invite both guests — heterogeneous by default
-			const guestA = activateGuestLifecycle(inviteGuest(nameA, typeA, workDir, salonDir, guestDir, runtime));
-			const guestB = activateGuestLifecycle(inviteGuest(nameB, typeB, workDir, salonDir, guestDir, runtime));
+			const guestA = activateGuestLifecycle(inviteGuest(
+				typeof params.guest_a_name === "string" ? params.guest_a_name : undefined,
+				typeA,
+				workDir,
+				salonDir,
+				guestDir,
+				runtime,
+			));
+			const guestB = activateGuestLifecycle(inviteGuest(
+				typeof params.guest_b_name === "string" ? params.guest_b_name : undefined,
+				typeB,
+				workDir,
+				salonDir,
+				guestDir,
+				runtime,
+			));
 			scanCodexSessionId(guestA);
 			scanCodexSessionId(guestB);
+			const nameA = guestA.name;
+			const nameB = guestB.name;
 
 			// Create discussion state
 			const disc: Discussion = {
