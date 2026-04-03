@@ -943,7 +943,10 @@ export default function salonExtension(pi: ExtensionAPI) {
 		if (activeGuest) {
 			cancelCodexSessionScan(name);
 			clearGuestForwardState(salonDir, name);
-			trackGuestSessionId(activeGuest, sessionId, { writeRuntimeFile: false, force: !!sessionId });
+			// Don't force-overwrite an existing session ID — the background scan result
+			// (from structured JSONL data) is more reliable than the pane-capture grep
+			// used by the wrapper script, which can produce truncated IDs.
+			trackGuestSessionId(activeGuest, sessionId, { writeRuntimeFile: false, force: !!sessionId && !activeGuest.sessionId });
 			const droppedQueuedCount = queuedGuestMessages.get(name)?.length || 0;
 			if (runtimeFileMode === "always" || activeGuest.sessionId) {
 				writeGuestRuntimeFile(activeGuest);
@@ -968,7 +971,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 		}
 		cancelCodexSessionScan(name);
 		clearGuestForwardState(salonDir, name);
-		trackGuestSessionId(inactiveRecord, sessionId, { writeRuntimeFile: false, force: !!sessionId });
+		trackGuestSessionId(inactiveRecord, sessionId, { writeRuntimeFile: false, force: !!sessionId && !inactiveRecord.sessionId });
 		if (persist) {
 			persistSalonState();
 		}
@@ -2047,6 +2050,7 @@ Guest responses are delivered to you automatically — you do NOT need to poll, 
 ## Keeping the user informed
 - Briefly tell the user what you're doing and why when starting collaboration
 - When guest responses arrive, distill the key insights — don't dump raw output
+- If a guest's recommendation conflicts with the user's previously stated intent, constraints, or decisions, call out the conflict explicitly instead of silently siding with the guest
 - Present your synthesis with your own judgment, not as a neutral relay
 
 # Message format
@@ -2167,10 +2171,15 @@ When these appear, process them thoughtfully — don't just echo them to the use
 					} catch {
 						// The tmux session may already be shutting down; the guest state update above is the important part.
 					}
-					const resumeHint = inactiveGuest.sessionId ? ` Session saved — use resume_guest to bring them back.` : "";
-					const queueHint = droppedQueuedCount > 0 ? ` ${droppedQueuedCount} queued message(s) were never delivered.` : "";
-					const exitLabel = inactiveGuest.lifecycleStatus === "suspended" ? "has been suspended" : "has left the salon";
-					pi.sendUserMessage(`[salon] Guest '${name}' ${exitLabel}.${resumeHint}${queueHint}`, { deliverAs: "followUp" });
+					// Don't notify the host LLM about host-initiated exits (session teardown).
+					// Sending a followUp during session_before_switch starts an agent turn whose
+					// agent_end event is lost when the framework disconnects/reconnects the agent
+					// subscription, leaving the "Working..." spinner stuck forever.
+					if (inactiveGuest.lifecycleStatus !== "suspended") {
+						const resumeHint = inactiveGuest.sessionId ? ` Session saved — use resume_guest to bring them back.` : "";
+						const queueHint = droppedQueuedCount > 0 ? ` ${droppedQueuedCount} queued message(s) were never delivered.` : "";
+						pi.sendUserMessage(`[salon] Guest '${name}' has left the salon.${resumeHint}${queueHint}`, { deliverAs: "followUp" });
+					}
 				}
 				return;
 			}
