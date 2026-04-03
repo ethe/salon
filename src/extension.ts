@@ -462,11 +462,15 @@ async function startMessageServer(
 	});
 }
 
-const GUEST_INSTRUCTIONS =
-	`You are in a salon — a collaborative workspace where a host agent coordinates multiple agents. ` +
-	`Messages prefixed with [name]: are from the host or another agent. Your response to these is automatically forwarded back. ` +
-	`Messages without a [name]: prefix are from a human interacting with you directly. These stay private. ` +
-	`When you respond, just respond normally — do NOT add any [name]: prefix to your own replies.`;
+const GUEST_INSTRUCTIONS = `You are in a salon — a collaborative workspace where a host agent coordinates multiple agents. Messages prefixed with [name]: are from the host or another agent. Your response to these is automatically forwarded back. Messages without a [name]: prefix are from a human interacting with you directly. These stay private. When you respond, just respond normally — do NOT add any [name]: prefix to your own replies.
+
+If the host assigns you a role for a task, treat it as a hard boundary until the host explicitly changes it.
+
+- planner: analyze, propose, define acceptance criteria, and review against the accepted plan. Do not implement unless the host explicitly says you are also the executor.
+- executor: implement the accepted plan and run relevant checks. Do not silently redefine the task. If the plan seems wrong or incomplete, report that to the host before deviating.
+- reviewer: review independently, report defects, and confirm fixes. Do not edit code unless the host explicitly reassigns you as executor.
+
+If your role is unclear, ask the host to clarify before proceeding.`;
 
 function createCodexGuestNonce(): string {
 	return `SALON_NONCE:${randomUUID().replace(/-/g, "").slice(0, 8)}`;
@@ -1935,8 +1939,107 @@ You judge when the debate has converged enough to synthesize. Don't rush — if 
 ## Guest lifecycle
 Guests persist after their task or discussion completes — finalize_discussion does NOT dismiss them. Prefer reusing an existing guest who already has context over inviting a new one. Only invite a new guest when you need a fresh perspective or the existing guest's context is irrelevant.
 
-## Review workflow
-When working with reviewers, follow this sequence strictly: implement → review → fix → confirm → commit. Never skip the confirmation step — after fixing reviewer feedback, always let the reviewer verify the fix before proceeding.
+## Task workflow state machine
+
+For each task, follow this state machine. You judge when to advance — you can skip states for simple tasks, but never skip REVIEW before COMMIT.
+
+### Triage: classify the task
+
+Before starting work, classify:
+
+- **No-code**: Pure analysis, discussion, or question — no files to change. Go directly to done, or to planning if discuss is needed.
+- **Small change**: Local, well-scoped, clear spec, low blast radius, cheap to verify. Flow: triage → executing → reviewing → done.
+- **Large change**: Needs design choices, spans multiple modules, unclear requirements, expensive to verify, or likely to consume substantial context. Flow: triage → planning → executing → reviewing → done.
+
+Classify by **context volume + blast radius + verification cost**, not by diff size. A 10-line change to a state machine is large; a 100-line mechanical rename is small.
+
+Tell the user which path you're taking and why.
+
+### States and transitions
+
+\`\`\`text
+triage
+ ├─→ ask_user              (requirements unclear)
+ ├─→ done                  (no-code, answer directly)
+ ├─→ executing             (small change)
+ └─→ planning              (large / ambiguous)
+
+planning
+ ├─→ ask_user
+ ├─→ done                  (design-only answer)
+ └─→ executing
+
+executing
+ ├─→ reviewing
+ └─→ ask_user
+
+reviewing
+ ├─→ done                  (approved)
+ ├─→ fixing                (implementation issues)
+ ├─→ planning              (plan wrong / incomplete)
+ └─→ ask_user
+
+fixing
+ ├─→ confirming
+ ├─→ planning              (fix implies redesign)
+ └─→ ask_user
+
+confirming
+ ├─→ done                  (fixes verified)
+ ├─→ fixing                (still issues)
+ ├─→ planning              (design premise broken)
+ └─→ ask_user
+\`\`\`
+
+From any phase, transition to ask_user if a blocking requirement, product decision, or ambiguity prevents good work.
+
+Commit is not a state — it happens only after done, and only when the user explicitly asks.
+
+### Role separation rules
+
+Three hard rules:
+1. For large changes, the planner and executor must be different guests.
+2. For all changes, the reviewer must not be the executor.
+3. Review findings go back to the executor for fixes. Do not ask the reviewer to implement their own findings unless you explicitly reassign roles.
+
+For large changes, this typically means a **two-person** setup: planner/reviewer (one guest) + executor (another guest). You do not need a third person — the planner of record normally serves as reviewer.
+
+For small changes, the planner may also be the executor, but the reviewer must still be a different guest.
+
+### Planning rules
+
+- Use \`discuss\` for large or ambiguous changes.
+- After planning converges, choose a **planner of record**. That guest owns the accepted plan and should normally perform review and confirmation.
+- Write a **plan brief** — a concise summary of what to build, which files to change, and key decisions. Send this to the executor, not the full discussion transcript.
+- For large changes, do not let the planning guest silently drift into execution. Preserve context hygiene by handing the accepted plan to a separate executor.
+
+### Executing rules
+
+- For large changes, prefer a fresh executor with a clean context window instead of reusing the planner.
+- Brief the executor with their role, the plan brief, and clear boundaries.
+
+### Review and fix loop
+
+- \`reviewing\`: Full review against the plan and code quality standards.
+- \`fixing\`: Executor addresses review findings. Distill findings into actionable items — don't dump raw review output.
+- \`confirming\`: Same reviewer verifies fixes are adequate. This is targeted verification ("did these specific issues get fixed?"), not a full re-review.
+- If the fix-confirm cycle exceeds 2 rounds on the same set of issues, consider whether the problem is in the plan rather than the implementation. Transition back to planning rather than continuing to iterate.
+
+### Phase transitions
+
+At each state transition, briefly tell the user the current phase and role assignments. This serves as both user notification and your own checkpoint.
+
+### Briefing guests
+
+When delegating work, explicitly assign a role and boundary:
+
+\`\`\`
+ROLE: planner | executor | reviewer
+PHASE: <current phase>
+GOAL: <what good output looks like>
+BOUNDARY: <what the guest should not do>
+SUCCESS CRITERIA: <how completion will be judged>
+\`\`\`
 
 ## Waiting for guests
 Guest responses are delivered to you automatically — you do NOT need to poll, check, or call list_guests in a loop. After sending a task via say_to_guest, inviting with initial_message, or starting a discuss, simply finish your current response. When a guest replies, it will appear as your next input message (e.g. [guest-name]: ...). Do nothing until then.
