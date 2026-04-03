@@ -288,19 +288,11 @@ function generateGuestName(): string {
 	return name;
 }
 
-function safeLabelForFilename(value: string): string {
-	const sanitized = value.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
-	return sanitized || "guest";
-}
-
 // ── Message send/queue (module-level for testability) ─────────────────
 
 interface MessageContext {
 	runtime: GuestRuntime;
 	salonDir: string;
-	getMsgFileCounter: () => number;
-	incMsgFileCounter: () => number;
-	msgLengthThreshold: number;
 	incForwardTicketCounter?: () => number;
 }
 
@@ -340,16 +332,7 @@ function sayToGuestImpl(ctx: MessageContext, guest: Guest, message: string, from
 
 	guest.eventStatus = "working";
 	const prefix = `[${from}]: `;
-	let outboundMessage: string;
-	if (message.length <= ctx.msgLengthThreshold && !message.includes("\n")) {
-		outboundMessage = `${prefix}${message}`;
-	} else {
-		const exchangeDir = join(ctx.salonDir, "exchange");
-		mkdirSync(exchangeDir, { recursive: true });
-		const msgFile = join(exchangeDir, `${ctx.incMsgFileCounter()}_${safeLabelForFilename(from)}.md`);
-		writeFileSync(msgFile, message);
-		outboundMessage = `${prefix}Read ${msgFile} and respond.`;
-	}
+	const outboundMessage = `${prefix}${message}`;
 	const ticketPath = createGuestForwardTicket(ctx.salonDir, guest.name, ctx.incForwardTicketCounter?.());
 	try {
 		ctx.runtime.send(guest.runtimeId, outboundMessage);
@@ -736,16 +719,12 @@ function inviteGuest(
 	if (type === "codex") {
 		cmd = joinShellArgs(["codex", "-c", `model_instructions_file=${instructionsFile}`]);
 	} else {
-		const exchangeDir = join(salonDir, "exchange");
-		mkdirSync(exchangeDir, { recursive: true });
 		cmd = joinShellArgs([
 			"claude",
 			"--session-id",
 			sessionId!,
 			"--append-system-prompt-file",
 			instructionsFile,
-			"--add-dir",
-			exchangeDir,
 		]);
 	}
 
@@ -782,14 +761,10 @@ export default function salonExtension(pi: ExtensionAPI) {
 
 	mkdirSync(guestDir, { recursive: true });
 
-	let msgFileCounter = 0;
 	let forwardTicketCounter = 0;
 	const msgCtx: MessageContext = {
 		runtime,
 		salonDir,
-		getMsgFileCounter: () => msgFileCounter,
-		incMsgFileCounter: () => ++msgFileCounter,
-		msgLengthThreshold: 2000,
 		incForwardTicketCounter: () => ++forwardTicketCounter,
 	};
 	let pendingResumeSummary: string | undefined;
@@ -1163,22 +1138,6 @@ export default function salonExtension(pi: ExtensionAPI) {
 		guestNameOrdinals.clear();
 	}
 
-	function restoreMsgFileCounter() {
-		const exchangeDir = join(salonDir, "exchange");
-		if (!existsSync(exchangeDir)) {
-			msgFileCounter = 0;
-			return;
-		}
-
-		let maxCounter = 0;
-		for (const fileName of readdirSync(exchangeDir)) {
-			const match = /^(\d+)_/.exec(fileName);
-			if (!match) continue;
-			maxCounter = Math.max(maxCounter, Number(match[1]));
-		}
-		msgFileCounter = maxCounter;
-	}
-
 	function isSalonStateSnapshot(value: unknown): value is SalonStateSnapshot {
 		if (!value || typeof value !== "object") return false;
 		const snapshot = value as Partial<SalonStateSnapshot>;
@@ -1424,16 +1383,12 @@ export default function salonExtension(pi: ExtensionAPI) {
 		if (dismissed.type === "codex") {
 			cmd = joinShellArgs(["codex", "resume", dismissed.sessionId!, "-c", `model_instructions_file=${instructionsFile}`]);
 		} else {
-			const exchangeDir = join(salonDir, "exchange");
-			mkdirSync(exchangeDir, { recursive: true });
 			cmd = joinShellArgs([
 				"claude",
 				"--resume",
 				dismissed.sessionId!,
 				"--append-system-prompt-file",
 				instructionsFile,
-				"--add-dir",
-				exchangeDir,
 			]);
 		}
 
@@ -2059,7 +2014,6 @@ When these appear, process them thoughtfully — don't just echo them to the use
 
 	function restoreSalonSession(ctx: { sessionManager: { getBranch(): Array<{ type?: string; customType?: string; data?: unknown }> } }) {
 		clearRuntimeState();
-		restoreMsgFileCounter();
 		const entries = ctx.sessionManager.getBranch();
 		let restoredSnapshot = false;
 		for (let i = entries.length - 1; i >= 0; i--) {

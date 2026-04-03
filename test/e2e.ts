@@ -361,6 +361,33 @@ console.log("\n== 9. Send keys with submit key ==");
 	tmux(`kill-session -t "${TMUX_SESSION}"`);
 }
 
+console.log("\n== 9b. Multiline send via TmuxBackend.send() ==");
+{
+	tmux(`kill-session -t "${TMUX_SESSION}"`);
+	tmux(`new-session -d -s "${TMUX_SESSION}" -x 100 -y 30`);
+	tmux(`set-environment -t "${TMUX_SESSION}" SALON_NODE_BIN "/usr/bin"`);
+
+	const backend = new TmuxBackend(TMUX_SESSION);
+	const runtimeId = backend.spawn({
+		name: "multiline-test",
+		guestType: "claude",
+		workDir: "/tmp",
+		command: "cat",
+		salonDir: SALON_DIR,
+	});
+	await sleep(1000);
+
+	backend.send(runtimeId, "[host]: line one\nline two\nline three");
+	await sleep(1000);
+
+	const output = tmux(`capture-pane -t "${runtimeId}" -p`);
+	assert("Multiline send: first line present", output.includes("line one"));
+	assert("Multiline send: second line present", output.includes("line two"));
+	assert("Multiline send: third line present", output.includes("line three"));
+
+	tmux(`kill-session -t "${TMUX_SESSION}"`);
+}
+
 console.log("\n== 10. Guest termination uses correct exit commands ==");
 {
 	const backend = new TmuxBackend(TMUX_SESSION);
@@ -499,9 +526,6 @@ console.log("\n== 15. sayToGuest queues when guest not ready, sends when ready =
 	const fakeCtx = {
 		runtime: fakeRuntime,
 		salonDir: SALON_DIR,
-		getMsgFileCounter: () => 0,
-		incMsgFileCounter: () => 1,
-		msgLengthThreshold: 2000,
 		incForwardTicketCounter: () => ++forwardTicketCounter,
 	};
 
@@ -550,9 +574,6 @@ console.log("\n== 16. flushQueuedGuestMessages delivers queued messages via runt
 	const fakeCtx = {
 		runtime: fakeRuntime,
 		salonDir: SALON_DIR,
-		getMsgFileCounter: () => 0,
-		incMsgFileCounter: () => 1,
-		msgLengthThreshold: 2000,
 		incForwardTicketCounter: () => ++forwardTicketCounter,
 	};
 
@@ -606,9 +627,6 @@ console.log("\n== 17. invite_guest + sayToGuest(initial_message) → queue → f
 	const fakeCtx = {
 		runtime: fakeRuntime,
 		salonDir: SALON_DIR,
-		getMsgFileCounter: () => 0,
-		incMsgFileCounter: () => 1,
-		msgLengthThreshold: 2000,
 		incForwardTicketCounter: () => ++forwardTicketCounter,
 	};
 

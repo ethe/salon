@@ -282,7 +282,17 @@ export class TmuxBackend implements GuestRuntime {
 		this.exitCopyModeIfNeeded(paneId);
 		this.sendActive.add(paneId);
 		const item = queue.shift()!;
-		this.tmuxCommand(["send-keys", "-l", "-t", paneId, item.text]);
+		if (item.text.includes("\n")) {
+			// Use tmux paste-buffer for multiline text. With -p, tmux wraps the
+			// content in bracketed-paste escape sequences so the TUI receives
+			// newlines as literal characters instead of submit actions.
+			// -r preserves LF (default replaces LF→CR). -d deletes the buffer after paste.
+			const bufName = `salon-${paneId.replace(/%/g, "")}`;
+			this.tmuxCommand(["set-buffer", "-b", bufName, "--", item.text]);
+			this.tmuxCommand(["paste-buffer", "-b", bufName, "-d", "-p", "-r", "-t", paneId]);
+		} else {
+			this.tmuxCommand(["send-keys", "-l", "-t", paneId, item.text]);
+		}
 		setTimeout(() => {
 			try {
 				this.tmuxCommand(["send-keys", "-t", paneId, item.submitKey]);
