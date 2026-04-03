@@ -341,7 +341,7 @@ function sayToGuestImpl(ctx: MessageContext, guest: Guest, message: string, from
 	guest.eventStatus = "working";
 	const prefix = `[${from}]: `;
 	let outboundMessage: string;
-	if (message.length <= ctx.msgLengthThreshold) {
+	if (message.length <= ctx.msgLengthThreshold && !message.includes("\n")) {
 		outboundMessage = `${prefix}${message}`;
 	} else {
 		const exchangeDir = join(ctx.salonDir, "exchange");
@@ -1608,9 +1608,9 @@ export default function salonExtension(pi: ExtensionAPI) {
 			guestToDiscussion.set(nameB, discId);
 			persistSalonState();
 
-				// Messages are queued until each guest reports ready.
-				sayToGuest(guestA, params.message);
-				sayToGuest(guestB, params.message);
+			// Messages are queued until each guest reports ready.
+			sayToGuest(guestA, params.message);
+			sayToGuest(guestB, params.message);
 
 			return {
 				content: [{ type: "text" as const, text: `Discussion started on "${params.topic}" with guests '${nameA}' and '${nameB}'. Both are exploring independently. I'll report progress as it happens.` }],
@@ -1649,6 +1649,10 @@ export default function salonExtension(pi: ExtensionAPI) {
 
 			if (!guests.has(targetDisc.guestA) || !guests.has(targetDisc.guestB)) {
 				throw new Error("Discussion guests no longer available");
+			}
+
+			if (targetDisc.currentRound.responses.size > 0) {
+				throw new Error(`Discussion "${params.topic}" is still waiting for guest responses in the current round. Wait for both guests to respond before advancing.`);
 			}
 
 			const action = params.action as AdvanceAction;
