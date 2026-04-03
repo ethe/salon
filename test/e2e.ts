@@ -3,7 +3,7 @@
  */
 
 import { execSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { createServer, type Server } from "node:net";
 import { __test__ as extensionTest } from "../src/extension.ts";
@@ -45,19 +45,34 @@ function cleanup() {
 	if (existsSync(SALON_DIR)) rmSync(SALON_DIR, { recursive: true });
 }
 
-// Start a test socket server, returns received messages
+function listForwardEntries(guestName: string): string[] {
+	const forwardDir = extensionTest.getGuestForwardDir(SALON_DIR, guestName);
+	return existsSync(forwardDir) ? readdirSync(forwardDir).sort() : [];
+}
+
+// Start a test socket server, returns received messages.
+// Mirrors startMessageServer: parse eagerly on each data chunk and destroy
+// the connection once a complete message is received, so that nc (BSD) on
+// macOS doesn't hang waiting for the server to close.
 function startTestServer(): { server: Server; messages: Array<{ from: string; content: string }>; close: () => Promise<void> } {
 	const messages: Array<{ from: string; content: string }> = [];
 	if (existsSync(SOCK_PATH)) unlinkSync(SOCK_PATH);
 	const server = createServer((conn) => {
 		let data = "";
-		conn.on("data", (chunk) => { data += chunk.toString(); });
-		conn.on("end", () => {
+		let handled = false;
+		function tryHandle() {
+			if (handled) return;
 			try {
 				const msg = JSON.parse(data);
-				if (msg.from && msg.content) messages.push(msg);
-			} catch { /* ignore */ }
-		});
+				if (msg.from && msg.content) {
+					handled = true;
+					messages.push(msg);
+				}
+			} catch { /* incomplete JSON, wait for more data */ }
+			if (handled) conn.destroy();
+		}
+		conn.on("data", (chunk) => { data += chunk.toString(); tryHandle(); });
+		conn.on("end", tryHandle);
 	});
 	server.listen(SOCK_PATH);
 	return {
@@ -103,7 +118,7 @@ console.log("\n== 3. Codex CLI launch flags ==");
 	assert("Points to instructions file", expectedCmd.includes(instrFile));
 }
 
-console.log("\n== 4. Unix socket IPC — hook sends to server ==");
+console.log("\n== 4. Unix socket IPC — hook forwards only for host-directed turns ==");
 {
 	const hookPath = join(SCRIPT_DIR, "hooks", "agent-response.sh");
 	assert("Hook script exists", existsSync(hookPath));
@@ -111,10 +126,22 @@ console.log("\n== 4. Unix socket IPC — hook sends to server ==");
 	const { messages, close } = startTestServer();
 	await sleep(200);
 
-	// Test Claude Code format (stdin)
+	extensionTest.clearGuestForwardState(SALON_DIR, "hook-test");
+	extensionTest.createGuestForwardTicket(SALON_DIR, "hook-test", 1);
+
+	// Test Claude Code format (stdin): UserPromptSubmit arms, Stop forwards.
 	try {
 		execSync(
-			`echo '{"last_assistant_message":"hello from claude","stop_hook_active":false}' | SALON_GUEST_NAME=hook-test SALON_DIR="${SALON_DIR}" bash "${hookPath}"`,
+			`printf '%s' '{"hook_event_name":"UserPromptSubmit","prompt":"[host]: delegated task"}' | SALON_GUEST_NAME=hook-test SALON_DIR="${SALON_DIR}" bash "${hookPath}"`,
+			{ stdio: "pipe", timeout: 5000 },
+		);
+	} catch { /* ignore */ }
+	assert("Claude prompt submit does not forward immediately", messages.length === 0);
+	assert("Claude prompt submit arms the turn", existsSync(extensionTest.getGuestForwardArmedPath(SALON_DIR, "hook-test")));
+
+	try {
+		execSync(
+			`printf '%s' '{"hook_event_name":"Stop","last_assistant_message":"hello from claude","stop_hook_active":false}' | SALON_GUEST_NAME=hook-test SALON_DIR="${SALON_DIR}" bash "${hookPath}"`,
 			{ stdio: "pipe", timeout: 5000 },
 		);
 	} catch { /* ignore */ }
@@ -123,11 +150,15 @@ console.log("\n== 4. Unix socket IPC — hook sends to server ==");
 	assert("Claude message received via socket", messages.length === 1);
 	assert("Claude message from correct guest", messages[0]?.from === "hook-test");
 	assert("Claude message content", messages[0]?.content === "hello from claude");
+	assert("Claude armed marker cleared after stop", !existsSync(extensionTest.getGuestForwardArmedPath(SALON_DIR, "hook-test")));
+
+	extensionTest.clearGuestForwardState(SALON_DIR, "codex-test");
+	extensionTest.createGuestForwardTicket(SALON_DIR, "codex-test", 1);
 
 	// Test Codex format ($1 argument)
 	try {
 		execSync(
-			`SALON_GUEST_NAME=codex-test SALON_DIR="${SALON_DIR}" bash "${hookPath}" '{"type":"agent-turn-complete","last-assistant-message":"hello from codex"}'`,
+			`SALON_GUEST_NAME=codex-test SALON_DIR="${SALON_DIR}" bash "${hookPath}" '{"type":"agent-turn-complete","last-assistant-message":"hello from codex","input_messages":["[host]: delegated task"]}'`,
 			{ stdio: "pipe", timeout: 5000 },
 		);
 	} catch { /* ignore */ }
@@ -135,7 +166,10 @@ console.log("\n== 4. Unix socket IPC — hook sends to server ==");
 	await sleep(300);
 	assert("Codex message received via socket", messages.length === 2);
 	assert("Codex message content", messages[1]?.content === "hello from codex");
+	assert("Codex ticket consumed after forward", listForwardEntries("codex-test").length === 0);
 
+	extensionTest.clearGuestForwardState(SALON_DIR, "hook-test");
+	extensionTest.clearGuestForwardState(SALON_DIR, "codex-test");
 	await close();
 }
 
@@ -179,6 +213,50 @@ console.log("\n== 6. Hook skips non-response Codex events ==");
 	await close();
 }
 
+console.log("\n== 6b. Hook skips private guest chats even when tickets exist ==");
+{
+	const hookPath = join(SCRIPT_DIR, "hooks", "agent-response.sh");
+	const { messages, close } = startTestServer();
+	await sleep(200);
+
+	extensionTest.clearGuestForwardState(SALON_DIR, "private-claude");
+	extensionTest.createGuestForwardTicket(SALON_DIR, "private-claude", 1);
+
+	try {
+		execSync(
+			`printf '%s' '{"hook_event_name":"UserPromptSubmit","prompt":"hello privately"}' | SALON_GUEST_NAME=private-claude SALON_DIR="${SALON_DIR}" bash "${hookPath}"`,
+			{ stdio: "pipe", timeout: 5000 },
+		);
+		execSync(
+			`printf '%s' '{"hook_event_name":"Stop","last_assistant_message":"secret reply","stop_hook_active":false}' | SALON_GUEST_NAME=private-claude SALON_DIR="${SALON_DIR}" bash "${hookPath}"`,
+			{ stdio: "pipe", timeout: 5000 },
+		);
+	} catch { /* ignore */ }
+
+	await sleep(300);
+	assert("Claude private chat not forwarded", messages.length === 0);
+	assert("Claude private ticket remains unconsumed", listForwardEntries("private-claude").includes("ticket-000000000001"));
+	assert("Claude private chat never arms forwarding", !existsSync(extensionTest.getGuestForwardArmedPath(SALON_DIR, "private-claude")));
+
+	extensionTest.clearGuestForwardState(SALON_DIR, "private-codex");
+	extensionTest.createGuestForwardTicket(SALON_DIR, "private-codex", 1);
+
+	try {
+		execSync(
+			`SALON_GUEST_NAME=private-codex SALON_DIR="${SALON_DIR}" bash "${hookPath}" '{"type":"agent-turn-complete","last-assistant-message":"secret codex reply","input-messages":["hello privately"]}'`,
+			{ stdio: "pipe", timeout: 5000 },
+		);
+	} catch { /* ignore */ }
+
+	await sleep(300);
+	assert("Codex private chat not forwarded", messages.length === 0);
+	assert("Codex private ticket remains unconsumed", listForwardEntries("private-codex").includes("ticket-000000000001"));
+
+	extensionTest.clearGuestForwardState(SALON_DIR, "private-claude");
+	extensionTest.clearGuestForwardState(SALON_DIR, "private-codex");
+	await close();
+}
+
 console.log("\n== 7. Hook skips when no socket ==");
 {
 	const hookPath = join(SCRIPT_DIR, "hooks", "agent-response.sh");
@@ -211,9 +289,18 @@ console.log("\n== 7b. startMessageServer refuses an active socket owner ==");
 
 	assert("startMessageServer rejects active socket reuse", threw);
 
+	extensionTest.clearGuestForwardState(SALON_DIR, "active-sock");
+	extensionTest.createGuestForwardTicket(SALON_DIR, "active-sock", 1);
 	try {
 		execSync(
-			`echo '{"last_assistant_message":"socket still alive"}' | SALON_GUEST_NAME=active-sock SALON_DIR="${SALON_DIR}" bash "${hookPath}"`,
+			`printf '%s' '{"hook_event_name":"UserPromptSubmit","prompt":"[host]: socket still alive?"}' | SALON_GUEST_NAME=active-sock SALON_DIR="${SALON_DIR}" bash "${hookPath}"`,
+			{ stdio: "pipe", timeout: 5000 },
+		);
+	} catch { /* ignore */ }
+
+	try {
+		execSync(
+			`printf '%s' '{"hook_event_name":"Stop","last_assistant_message":"socket still alive","stop_hook_active":false}' | SALON_GUEST_NAME=active-sock SALON_DIR="${SALON_DIR}" bash "${hookPath}"`,
 			{ stdio: "pipe", timeout: 5000 },
 		);
 	} catch { /* ignore */ }
@@ -221,6 +308,7 @@ console.log("\n== 7b. startMessageServer refuses an active socket owner ==");
 	await sleep(300);
 	assert("Original socket server still receives messages", messages[0]?.content === "socket still alive");
 
+	extensionTest.clearGuestForwardState(SALON_DIR, "active-sock");
 	await close();
 }
 
@@ -398,6 +486,7 @@ console.log("\n== 15. sayToGuest queues when guest not ready, sends when ready =
 	// queuedGuestMessages; when guest.ready=true, runtime.send() is called.
 	const { sayToGuestImpl, queuedGuestMessages } = extensionTest;
 	const sentMessages: Array<{ runtimeId: string; text: string }> = [];
+	let forwardTicketCounter = 0;
 	const fakeRuntime = {
 		send(runtimeId: string, text: string) { sentMessages.push({ runtimeId, text }); },
 	} as any;
@@ -407,10 +496,12 @@ console.log("\n== 15. sayToGuest queues when guest not ready, sends when ready =
 		getMsgFileCounter: () => 0,
 		incMsgFileCounter: () => 1,
 		msgLengthThreshold: 2000,
+		incForwardTicketCounter: () => ++forwardTicketCounter,
 	};
 
 	// Clean state
 	queuedGuestMessages.clear();
+	extensionTest.clearGuestForwardState(SALON_DIR, "queue-test");
 
 	// Guest not ready → queued
 	const guest = {
@@ -425,6 +516,7 @@ console.log("\n== 15. sayToGuest queues when guest not ready, sends when ready =
 	assert("Message is in queuedGuestMessages", queued?.length === 1);
 	assert("Queued message content correct", queued?.[0]?.message === "hello world");
 	assert("Queued message from defaults to host", queued?.[0]?.from === "host");
+	assert("Queued message does not create a forward ticket", listForwardEntries("queue-test").length === 0);
 
 	// Guest ready → sent
 	guest.ready = true;
@@ -433,8 +525,10 @@ console.log("\n== 15. sayToGuest queues when guest not ready, sends when ready =
 	assert("runtime.send() called once", sentMessages.length === 1);
 	assert("runtime.send() receives prefixed message", sentMessages[0].text === "[reviewer]: second message");
 	assert("runtime.send() targets correct pane", sentMessages[0].runtimeId === "%fake");
+	assert("Sent message creates one forward ticket", listForwardEntries("queue-test").length === 1);
 
 	queuedGuestMessages.clear();
+	extensionTest.clearGuestForwardState(SALON_DIR, "queue-test");
 }
 
 console.log("\n== 16. flushQueuedGuestMessages delivers queued messages via runtime ==");
@@ -443,6 +537,7 @@ console.log("\n== 16. flushQueuedGuestMessages delivers queued messages via runt
 	// call flush, verify runtime.send() receives both in order.
 	const { sayToGuestImpl, flushQueuedGuestMessagesImpl, queuedGuestMessages } = extensionTest;
 	const sentMessages: Array<{ runtimeId: string; text: string }> = [];
+	let forwardTicketCounter = 0;
 	const fakeRuntime = {
 		send(runtimeId: string, text: string) { sentMessages.push({ runtimeId, text }); },
 	} as any;
@@ -452,9 +547,11 @@ console.log("\n== 16. flushQueuedGuestMessages delivers queued messages via runt
 		getMsgFileCounter: () => 0,
 		incMsgFileCounter: () => 1,
 		msgLengthThreshold: 2000,
+		incForwardTicketCounter: () => ++forwardTicketCounter,
 	};
 
 	queuedGuestMessages.clear();
+	extensionTest.clearGuestForwardState(SALON_DIR, "flush-test");
 
 	const guest = {
 		name: "flush-test", type: "claude" as const, runtimeId: "%fake2",
@@ -467,6 +564,7 @@ console.log("\n== 16. flushQueuedGuestMessages delivers queued messages via runt
 	sayToGuestImpl(fakeCtx, guest, "second task", "other-guest");
 	assert("Two messages queued", queuedGuestMessages.get("flush-test")?.length === 2);
 	assert("No sends yet", sentMessages.length === 0);
+	assert("Queued flush messages do not create tickets yet", listForwardEntries("flush-test").length === 0);
 
 	// Simulate guest_ready: flip ready, then flush
 	guest.ready = true;
@@ -477,8 +575,10 @@ console.log("\n== 16. flushQueuedGuestMessages delivers queued messages via runt
 	assert("First message delivered with host prefix", sentMessages[0].text === "[host]: first task");
 	assert("Second message delivered with custom prefix", sentMessages[1].text === "[other-guest]: second task");
 	assert("Both target correct pane", sentMessages.every((m) => m.runtimeId === "%fake2"));
+	assert("Flush creates one ticket per delivered message", listForwardEntries("flush-test").length === 2);
 
 	queuedGuestMessages.clear();
+	extensionTest.clearGuestForwardState(SALON_DIR, "flush-test");
 }
 
 console.log("\n== 17. invite_guest + sayToGuest(initial_message) → queue → flush → deliver ==");
@@ -491,6 +591,7 @@ console.log("\n== 17. invite_guest + sayToGuest(initial_message) → queue → f
 	// 5. Verify runtime.send() receives the correct prefixed message
 	const { inviteGuest, sayToGuestImpl, flushQueuedGuestMessagesImpl, guests, queuedGuestMessages } = extensionTest;
 	const sentMessages: Array<{ runtimeId: string; text: string }> = [];
+	let forwardTicketCounter = 0;
 	const fakeRuntime = {
 		spawn() { return "%fake-invite"; },
 		send(runtimeId: string, text: string) { sentMessages.push({ runtimeId, text }); },
@@ -502,11 +603,13 @@ console.log("\n== 17. invite_guest + sayToGuest(initial_message) → queue → f
 		getMsgFileCounter: () => 0,
 		incMsgFileCounter: () => 1,
 		msgLengthThreshold: 2000,
+		incForwardTicketCounter: () => ++forwardTicketCounter,
 	};
 
 	// Clean state
 	guests.clear();
 	queuedGuestMessages.clear();
+	extensionTest.clearGuestForwardState(SALON_DIR, "invite-test");
 
 	// Step 1: inviteGuest creates guest with ready=false
 	const guest = inviteGuest("invite-test", "claude", "/tmp", SALON_DIR, GUEST_DIR, fakeRuntime);
@@ -522,6 +625,7 @@ console.log("\n== 17. invite_guest + sayToGuest(initial_message) → queue → f
 	assert("initial_message returns 'queued'", status === "queued");
 	assert("No runtime.send() before ready", sentMessages.length === 0);
 	assert("Message queued in queuedGuestMessages", queuedGuestMessages.get("invite-test")?.length === 1);
+	assert("Queued initial message does not create ticket yet", listForwardEntries("invite-test").length === 0);
 
 	// Step 4: Simulate guest_ready event → flip ready + flush
 	guest.ready = true;
@@ -531,10 +635,12 @@ console.log("\n== 17. invite_guest + sayToGuest(initial_message) → queue → f
 	assert("runtime.send() called after flush", sentMessages.length === 1);
 	assert("Message has [host]: prefix", sentMessages[0].text === "[host]: please review the code");
 	assert("Queue empty after flush", !queuedGuestMessages.has("invite-test"));
+	assert("Flush creates a forward ticket for the delivered initial message", listForwardEntries("invite-test").length === 1);
 
 	// Cleanup module-level state
 	guests.delete("invite-test");
 	queuedGuestMessages.clear();
+	extensionTest.clearGuestForwardState(SALON_DIR, "invite-test");
 }
 
 // ══════════════════════════════════════════════════════════════════════
