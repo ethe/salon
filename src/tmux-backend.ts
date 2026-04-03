@@ -29,8 +29,29 @@ const TUI_PATTERNS = {
 	readyPromptGrepPattern: "\u276F|\u203A ",
 } as const;
 
+/** Tmux user option storing the salon display name for a pane (used in border labels). */
+const SALON_NAME_OPTION = "@salon_name";
+
+/**
+ * grep -E pattern that selects only salon-managed variables from
+ * `tmux show-environment -s` output, preventing unrelated inherited
+ * variables (e.g. npm_config_prefix) from leaking into pane shells.
+ *
+ * Must stay in sync with the keys set by buildEnvironment() in main.ts.
+ */
+const SALON_ENV_FILTER = "^(SALON_|ANTHROPIC_API_KEY=|OPENAI_API_KEY=|https?_proxy=|HTTPS?_PROXY=|no_proxy=|NO_PROXY=|ALL_PROXY=|all_proxy=)";
+
+/** Build a shell snippet that evals only salon-managed env vars from the tmux session. */
+function filteredEnvEval(tmuxSession: string): string {
+	return `eval "$(tmux show-environment -t ${shellQuote(tmuxSession)} -s | grep -E ${shellQuote(SALON_ENV_FILTER)})"`;
+}
+
 function shellQuote(value: string): string {
 	return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function nonInteractiveBashCommand(script: string): string {
+	return `bash --noprofile --norc -c ${shellQuote(script)}`;
 }
 
 function submitKeyForGuestType(type: "claude" | "codex"): string {
@@ -83,17 +104,20 @@ export class TmuxBackend implements GuestRuntime {
 	// ── GuestRuntime implementation ──────────────────────────────────
 
 	spawn(options: RuntimeSpawnOptions): string {
-		const runtimeId = this.spawnPane(options.workDir);
-		if (!runtimeId) throw new Error("Failed to create tmux pane");
-
-		const submitKey = submitKeyForGuestType(options.guestType);
-		this.submitKeys.set(runtimeId, submitKey);
-
 		const wrapperScript = join(options.salonDir, "guests", `${options.name}.wrapper.sh`);
 		writeFileSync(wrapperScript, this.buildWrapperScript(options));
 		chmodSync(wrapperScript, 0o755);
 
-		this.sendRaw(runtimeId, `exec bash ${shellQuote(wrapperScript)}`, "Enter");
+		// Launch the wrapper directly as a non-interactive command so zsh init
+		// (and prompt plugins such as p10k) never sees guest startup output.
+		const runtimeId = this.spawnPane(options.workDir, this.buildGuestPaneCommand(wrapperScript));
+		if (!runtimeId) throw new Error("Failed to create tmux pane");
+
+		this.tmuxCommand(["set-option", "-p", "-t", runtimeId, SALON_NAME_OPTION, options.name]);
+
+		const submitKey = submitKeyForGuestType(options.guestType);
+		this.submitKeys.set(runtimeId, submitKey);
+
 		return runtimeId;
 	}
 
@@ -211,14 +235,22 @@ export class TmuxBackend implements GuestRuntime {
 		return runTmux(args, "required");
 	}
 
-	private spawnPane(workDir: string): string {
+	private buildGuestPaneCommand(wrapperScript: string): string {
+		return nonInteractiveBashCommand(`exec bash ${shellQuote(wrapperScript)}`);
+	}
+
+	private spawnPane(workDir: string, command?: string): string {
 		const panes = this.listAliveRequired();
 		let newPaneId: string;
 		if (panes.length <= 1) {
-			newPaneId = this.tmuxCommand(["split-window", "-h", "-t", `${this.tmuxSession}:0.0`, "-p", "50", "-c", workDir, "-P", "-F", "#{pane_id}"]);
+			const args = ["split-window", "-h", "-t", `${this.tmuxSession}:0.0`, "-p", "50", "-c", workDir, "-P", "-F", "#{pane_id}"];
+			if (command) args.push(command);
+			newPaneId = this.tmuxCommand(args);
 		} else {
 			const lastPane = panes[panes.length - 1];
-			newPaneId = this.tmuxCommand(["split-window", "-v", "-t", lastPane, "-c", workDir, "-P", "-F", "#{pane_id}"]);
+			const args = ["split-window", "-v", "-t", lastPane, "-c", workDir, "-P", "-F", "#{pane_id}"];
+			if (command) args.push(command);
+			newPaneId = this.tmuxCommand(args);
 		}
 		this.equalize();
 		return newPaneId;
@@ -231,6 +263,13 @@ export class TmuxBackend implements GuestRuntime {
 		this.drainSendQueue(paneId);
 	}
 
+	private exitCopyModeIfNeeded(paneId: string): void {
+		const inMode = this.tmuxStatusQuery(["display-message", "-t", paneId, "-p", "#{pane_in_mode}"]);
+		if (inMode === "1") {
+			this.tmuxCommand(["send-keys", "-X", "-t", paneId, "cancel"]);
+		}
+	}
+
 	private drainSendQueue(paneId: string): void {
 		if (this.sendActive.has(paneId)) return;
 		const queue = this.sendQueues.get(paneId);
@@ -239,6 +278,7 @@ export class TmuxBackend implements GuestRuntime {
 			return;
 		}
 
+		this.exitCopyModeIfNeeded(paneId);
 		this.sendActive.add(paneId);
 		const item = queue.shift()!;
 		this.tmuxCommand(["send-keys", "-l", "-t", paneId, item.text]);
@@ -259,7 +299,7 @@ export class TmuxBackend implements GuestRuntime {
 		return [
 			`#!/usr/bin/env bash`,
 			`set -uo pipefail -m`,
-			...(tmuxSession ? [`eval "$(tmux show-environment -t ${shellQuote(tmuxSession)} -s)"`] : []),
+			...(tmuxSession ? [filteredEnvEval(tmuxSession)] : []),
 			`export PATH="$SALON_NODE_BIN:$PATH"`,
 			`export SALON_DIR=${shellQuote(options.salonDir)} SALON_GUEST_NAME=${shellQuote(options.name)}`,
 			`SOCK=${shellQuote(sockPath)}`,
@@ -310,6 +350,7 @@ export class TmuxBackend implements GuestRuntime {
 
 export class TmuxLauncher implements SalonLauncher {
 	private readonly tmuxSession: string;
+	private hostWorkDir?: string;
 
 	constructor(tmuxSession: string) {
 		this.tmuxSession = tmuxSession;
@@ -329,12 +370,29 @@ export class TmuxLauncher implements SalonLauncher {
 	}
 
 	createSession(workDir: string): void {
+		this.hostWorkDir = workDir;
 		if (!this.sessionExists()) {
-			this.tmuxCommand(["new-session", "-d", "-s", this.tmuxSession, "-x", "200", "-y", "50", "-c", workDir]);
+			this.tmuxCommand([
+				"new-session",
+				"-d",
+				"-s",
+				this.tmuxSession,
+				"-x",
+				"200",
+				"-y",
+				"50",
+				"-c",
+				workDir,
+				// Keep the pane alive without starting the user's interactive shell.
+				nonInteractiveBashCommand("exec tail -f /dev/null"),
+			]);
 		}
 		this.tmuxCommand(["set-option", "-t", this.tmuxSession, "-g", "mouse", "on"]);
 		this.tmuxCommand(["set-option", "-t", this.tmuxSession, "-g", "extended-keys", "on"]);
 		this.tmuxCommand(["set-option", "-t", this.tmuxSession, "-g", "extended-keys-format", "csi-u"]);
+		this.tmuxCommand(["set-option", "-t", this.tmuxSession, "pane-border-status", "top"]);
+		this.tmuxCommand(["set-option", "-t", this.tmuxSession, "pane-border-format", ` #{${SALON_NAME_OPTION}} `]);
+		this.tmuxCommand(["set-option", "-p", "-t", `${this.tmuxSession}:0.0`, SALON_NAME_OPTION, "host"]);
 		this.tmuxCommand(["rename-window", "-t", `${this.tmuxSession}:0`, "salon"]);
 	}
 
@@ -359,9 +417,16 @@ export class TmuxLauncher implements SalonLauncher {
 
 	launchHost(command: string): void {
 		const hostPane = `${this.tmuxSession}:0.0`;
-		const envSetup = `eval "$(tmux show-environment -t ${shellQuote(this.tmuxSession)} -s)" && export PATH="$SALON_NODE_BIN:$PATH"`;
-		this.tmuxCommand(["send-keys", "-t", hostPane, "-l", `${envSetup} && exec ${command}`]);
-		this.tmuxCommand(["send-keys", "-t", hostPane, "Enter"]);
+		const envSetup = `${filteredEnvEval(this.tmuxSession)} && export PATH="$SALON_NODE_BIN:$PATH"`;
+		// Replace the placeholder process with the host directly, again avoiding
+		// any interactive shell startup output in the pane.
+		const launchCommand = nonInteractiveBashCommand(`${envSetup} && exec ${command}`);
+		const args = ["respawn-pane", "-k", "-t", hostPane];
+		if (this.hostWorkDir) {
+			args.push("-c", this.hostWorkDir);
+		}
+		args.push(launchCommand);
+		this.tmuxCommand(args);
 	}
 
 	private tmuxCommand(args: string[]): string {
