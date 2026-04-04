@@ -627,7 +627,7 @@ function createCodexGuestNonce(): string {
 
 function buildGuestInstructions(name: string, nonce?: string): string {
 	const autonomousConstraint = SALON_CONTAINER_ID
-		? `\n\nYou are working on a task inside Docker container ${SALON_CONTAINER_ID}.\nALL commands must be run via: docker exec ${SALON_CONTAINER_ID} bash -c '<command>'\nFor multi-line file writes: docker exec ${SALON_CONTAINER_ID} bash -c 'cat > /path << "EOF"\ncontent\nEOF'\nDo NOT use your native Read, Edit, Grep, or Bash tools on the host filesystem — they operate locally, not inside the container.`
+		? `\n\nYou are working on a task inside Docker container ${SALON_CONTAINER_ID}.\nALL commands must be run via: docker exec ${SALON_CONTAINER_ID} bash -c '<command>'\nFor multi-line file writes: docker exec ${SALON_CONTAINER_ID} bash -c 'cat > /path << "EOF"\ncontent\nEOF'\nDo NOT use your native Read, Edit, Grep, or Bash tools on the host filesystem — they operate locally, not inside the container.\nIf docker exec fails with any error, STOP immediately and report the failure to the host.\nDo NOT fall back to writing files on the host filesystem — files on the host are completely invisible to the benchmark verifier and will cause the task to fail.`
 		: "";
 	const base = `Your name in this salon is ${name}.\n\n${GUEST_INSTRUCTIONS}${autonomousConstraint}`;
 	return nonce ? `${base}\n\n${nonce}` : base;
@@ -2697,6 +2697,15 @@ You are in AUTONOMOUS mode. No human is in the loop. A Python adapter monitors y
   The only tools you should use directly are: invite_guest, say_to_guest, discuss,
   advance_discussion, submit_synthesis, finalize_discussion, finish_task, list_guests,
   dismiss_guest, and resume_guest.
+- When briefing guests, relay the task description verbatim.
+  Do NOT rephrase paths, filenames, input formats, or calling conventions.
+  The task description is the source of truth. If it says /app/output.npy,
+  that is where the artifact must be placed — do not invent alternative paths.
+- Before calling finish_task(status="solved"), verify the expected artifact
+  exists at the benchmark-specified path:
+    docker exec ${SALON_CONTAINER_ID} ls -lh /app/<expected-artifact>
+  If the artifact does not exist at the correct path, do NOT call finish_task(solved).
+  Fix the path first.
 
 ## Container access
 All work happens inside Docker container ${SALON_CONTAINER_ID}.
@@ -2722,6 +2731,15 @@ If docker exec fails with "No such container" or "is not running", call finish_t
 3. For straightforward tasks: assign one guest as executor, other as reviewer.
 4. After execution: have the reviewer verify inside the container (run tests, check output files, inspect results).
 5. Call finish_task based on verification outcome.
+
+## Reviewer acceptance checklist
+Before approving, verify ALL acceptance criteria:
+1. The expected artifact exists at the benchmark-specified path (check with ls /app/)
+2. If the task directory contains a test harness (/tests/, pytest.ini, run-tests.sh),
+   run it: docker exec ${SALON_CONTAINER_ID} bash -c 'cd /app && python -m pytest -q 2>&1 | tail -20'
+3. For tasks requiring "unchanged" output (e.g., filtering, transformation),
+   verify the unchanged-input invariant holds on a sample of clean inputs
+4. Do NOT only validate the specific cases you designed — validate what the benchmark validates
 
 ## Termination — call finish_task promptly
 
