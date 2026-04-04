@@ -245,7 +245,7 @@ export class TmuxBackend implements GuestRuntime {
 		const panes = this.listAliveRequired();
 		let newPaneId: string;
 		if (panes.length <= 1) {
-			const args = ["split-window", "-h", "-t", `${this.tmuxSession}:0.0`, "-p", "50", "-c", workDir, "-P", "-F", "#{pane_id}"];
+			const args = ["split-window", "-h", "-t", `${this.tmuxSession}:0.0`, "-l", "50%", "-c", workDir, "-P", "-F", "#{pane_id}"];
 			if (command) args.push(command);
 			newPaneId = this.tmuxCommand(args);
 		} else {
@@ -404,8 +404,8 @@ export class TmuxLauncher implements SalonLauncher {
 		// shell history when agents execute inside tmux panes.
 		this.tmuxCommand(["set-environment", "-t", this.tmuxSession, "HISTFILE", SALON_HISTFILE]);
 		this.tmuxCommand(["set-option", "-t", this.tmuxSession, "-g", "mouse", "on"]);
-		this.tmuxCommand(["set-option", "-t", this.tmuxSession, "-g", "extended-keys", "always"]);
-		this.tmuxCommand(["set-option", "-t", this.tmuxSession, "-g", "extended-keys-format", "csi-u"]);
+		this.tmuxStatusQuery(["set-option", "-t", this.tmuxSession, "-g", "extended-keys", "always"]);
+		this.tmuxStatusQuery(["set-option", "-t", this.tmuxSession, "-g", "extended-keys-format", "csi-u"]);
 		this.tmuxCommand(["set-option", "-t", this.tmuxSession, "pane-border-status", "top"]);
 		this.tmuxCommand(["set-option", "-t", this.tmuxSession, "pane-border-format", ` #{${SALON_NAME_OPTION}} `]);
 		this.tmuxCommand(["set-option", "-p", "-t", `${this.tmuxSession}:0.0`, SALON_NAME_OPTION, "host"]);
@@ -447,5 +447,9 @@ export class TmuxLauncher implements SalonLauncher {
 
 	private tmuxCommand(args: string[]): string {
 		return runTmux(args, "required");
+	}
+
+	private tmuxStatusQuery(args: string[]): string {
+		return runTmux(args, "tolerant");
 	}
 }
