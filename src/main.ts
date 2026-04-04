@@ -35,6 +35,7 @@ function listExistingSalonSessions(): string[] {
 
 function buildEnvironment(): Record<string, string> {
 	const vars: Record<string, string> = {};
+	const pathPrefixes = [dirname(process.execPath)];
 
 	for (const key of [
 		"http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "no_proxy", "NO_PROXY",
@@ -53,18 +54,22 @@ function buildEnvironment(): Record<string, string> {
 	vars.SALON_INSTANCE = SALON_INSTANCE;
 	vars.SALON_TMUX_SESSION = TMUX_SESSION;
 	vars.SALON_WORK_DIR = WORK_DIR;
-	vars.SALON_NODE_BIN = dirname(process.execPath);
 	if (AUTONOMOUS_MODE) {
 		vars.SALON_AUTONOMOUS = "1";
+		if (process.env.SALON_TB_BRIDGE_SOCK) {
+			vars.SALON_TB_BRIDGE_SOCK = process.env.SALON_TB_BRIDGE_SOCK;
+		}
+		if (process.env.SALON_TB_SHIM_DIR) {
+			vars.SALON_TB_SHIM_DIR = process.env.SALON_TB_SHIM_DIR;
+			pathPrefixes.unshift(process.env.SALON_TB_SHIM_DIR);
+		}
 	}
+	vars.SALON_NODE_BIN = pathPrefixes.join(":");
 	if (process.env.SALON_TASK_FILE) {
 		vars.SALON_TASK_FILE = process.env.SALON_TASK_FILE;
 	}
 	if (process.env.SALON_RESULT_FILE) {
 		vars.SALON_RESULT_FILE = process.env.SALON_RESULT_FILE;
-	}
-	if (process.env.SALON_CONTAINER_ID) {
-		vars.SALON_CONTAINER_ID = process.env.SALON_CONTAINER_ID;
 	}
 
 	return vars;

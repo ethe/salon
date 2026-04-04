@@ -39,7 +39,6 @@ const TMUX_SESSION = process.env.SALON_TMUX_SESSION || `salon-${SALON_INSTANCE}`
 const SALON_AUTONOMOUS = process.env.SALON_AUTONOMOUS === "1";
 const SALON_TASK_FILE = process.env.SALON_TASK_FILE;
 const SALON_RESULT_FILE = process.env.SALON_RESULT_FILE;
-const SALON_CONTAINER_ID = process.env.SALON_CONTAINER_ID;
 const SALON_STATE_ENTRY_TYPE = "salon_state";
 const SALON_STATE_VERSION = 1;
 const SALON_STATUS_MESSAGE_TYPE = "salon-status";
@@ -621,13 +620,24 @@ Rules:
 
 If your role is unclear, ask the host to clarify before proceeding.`;
 
+const AUTONOMOUS_TB_GUEST_BRIEF = `You are working on a task inside a Docker container.
+Use the \`tb\` tool to interact with the container:
+  tb exec -- 'bash command'      # run a command in the container
+  tb exec --timeout 60 -- 'cmd'  # with custom timeout (default: 120s)
+  tb read /app/file.py           # read a file from the container
+  tb write /app/file.py          # write a file (pipe content via stdin)
+  tb ls /app                     # list files
+
+Do NOT invoke Docker directly, use ssh, or use your native Read/Edit/Bash tools to access container files.
+The tb tool is the ONLY way to interact with the task container.`;
+
 function createCodexGuestNonce(): string {
 	return `SALON_NONCE:${randomUUID().replace(/-/g, "").slice(0, 8)}`;
 }
 
 function buildGuestInstructions(name: string, nonce?: string): string {
-	const autonomousConstraint = SALON_CONTAINER_ID
-		? `\n\nYou are working on a task inside Docker container ${SALON_CONTAINER_ID}.\nALL commands must be run via: docker exec ${SALON_CONTAINER_ID} bash -c '<command>'\nFor multi-line file writes: docker exec ${SALON_CONTAINER_ID} bash -c 'cat > /path << "EOF"\ncontent\nEOF'\nDo NOT use your native Read, Edit, Grep, or Bash tools on the host filesystem — they operate locally, not inside the container.\nIf docker exec fails with any error, STOP immediately and report the failure to the host.\nDo NOT fall back to writing files on the host filesystem — files on the host are completely invisible to the benchmark verifier and will cause the task to fail.`
+	const autonomousConstraint = SALON_AUTONOMOUS
+		? `\n\n${AUTONOMOUS_TB_GUEST_BRIEF}`
 		: "";
 	const base = `Your name in this salon is ${name}.\n\n${GUEST_INSTRUCTIONS}${autonomousConstraint}`;
 	return nonce ? `${base}\n\n${nonce}` : base;
@@ -2692,7 +2702,7 @@ You are in AUTONOMOUS mode. No human is in the loop. A Python adapter monitors y
 - invite_guest automatically forces dangerously_skip_permissions=true.
 - Skip all user-facing narration. Do not explain state transitions, do not summarize guest output for "the user." Minimize your own text output — focus on tool calls and guest coordination.
 - You MUST NOT use your own file tools (read, write, edit, bash, grep, glob) to work on the task directly.
-  You are a coordinator only. All task work must be done by guests via docker exec.
+  You are a coordinator only. All task work must be done by guests via tb.
 - You MUST invite at least one guest before making progress on the task.
   The only tools you should use directly are: invite_guest, say_to_guest, discuss,
   advance_discussion, submit_synthesis, finalize_discussion, finish_task, list_guests,
@@ -2703,32 +2713,28 @@ You are in AUTONOMOUS mode. No human is in the loop. A Python adapter monitors y
   that is where the artifact must be placed — do not invent alternative paths.
 - Before calling finish_task(status="solved"), verify the expected artifact
   exists at the benchmark-specified path:
-    docker exec ${SALON_CONTAINER_ID} ls -lh /app/<expected-artifact>
+    tb exec -- 'ls -lh /app/<expected-artifact>'
   If the artifact does not exist at the correct path, do NOT call finish_task(solved).
   Fix the path first.
 
 ## Container access
-All work happens inside Docker container ${SALON_CONTAINER_ID}.
+All work happens inside the task container, accessed via the tb bridge.
 
-Guest commands MUST use this exact form:
-  docker exec ${SALON_CONTAINER_ID} bash -c '<command>'
+Guests must use the tb tool exactly as documented in their brief:
+  tb exec -- 'bash command'
+  tb exec --timeout 60 -- 'cmd'
+  tb read /app/file.py
+  tb write /app/file.py
+  tb ls /app
 
-For multi-line writes, use a quoted heredoc delimiter to prevent premature expansion:
-  docker exec ${SALON_CONTAINER_ID} bash -c 'cat > /path/to/file << "EOF"
-  file content here
-  EOF'
+Guests must NOT invoke Docker directly, use ssh, or use their native Read/Edit/Grep/Bash tools on the host filesystem — those operate outside the container.
+All container inspection and mutation must go through tb.
 
-For commands containing single quotes, use double-quote wrapping:
-  docker exec ${SALON_CONTAINER_ID} bash -c "python3 -c 'print(1)'"
-
-Guests must NOT use their native Read, Edit, Grep, or Bash tools on the host filesystem — those operate on the host, not inside the container. All file inspection must go through docker exec (cat, grep, find, etc.).
-
-If docker exec fails with "No such container" or "is not running", call finish_task(status="blocked") immediately — the environment is broken.
+If tb fails because the bridge/socket is unavailable or container access is broken, call finish_task(status="blocked") immediately.
 
 ## Capability preflight (run before assigning roles)
 Each guest must verify container access AND write capability:
-  docker exec ${SALON_CONTAINER_ID} bash -c 'echo ok > /tmp/__salon_probe && rm /tmp/__salon_probe' 2>&1 || \\
-  sudo docker exec ${SALON_CONTAINER_ID} bash -c 'echo ok > /tmp/__salon_probe && rm /tmp/__salon_probe' 2>&1
+  tb exec -- 'echo access_ok && echo ok > /tmp/__probe && rm /tmp/__probe'
 
 If a guest fails this check, do NOT assign them container write tasks.
 Reassign them to analysis/planning/review only.
@@ -2744,7 +2750,7 @@ If BOTH guests fail: call finish_task(blocked) immediately.
 2. For tasks requiring design: use discuss, then assign executor + reviewer.
 3. For straightforward tasks: assign one guest as executor, other as reviewer.
 4. Artifact-first: For tasks requiring output files, write a best-effort version
-   to the target path within the first 3-4 docker exec rounds, then iterate.
+   to the target path within the first 3-4 tb rounds, then iterate.
    A partial /app/output.npy that exists beats a perfect analysis that never gets written.
 5. After execution: have the reviewer verify inside the container (run tests, check output files, inspect results).
 6. Call finish_task based on verification outcome.
@@ -2753,7 +2759,7 @@ If BOTH guests fail: call finish_task(blocked) immediately.
 Before approving, verify ALL acceptance criteria:
 1. The expected artifact exists at the benchmark-specified path (check with ls /app/)
 2. If the task directory contains a test harness (/tests/, pytest.ini, run-tests.sh),
-   run it: docker exec ${SALON_CONTAINER_ID} bash -c 'cd /app && python -m pytest -q 2>&1 | tail -20'
+   run it: tb exec -- 'cd /app && python -m pytest -q 2>&1 | tail -20'
 3. For tasks requiring "unchanged" output (e.g., filtering, transformation),
    verify the unchanged-input invariant holds on a sample of clean inputs
 4. Do NOT only validate the specific cases you designed — validate what the benchmark validates
@@ -2772,7 +2778,7 @@ finish_task(status="incomplete"):
   Partial progress was made. Use after: 2 fix-review cycles failed on the same issue, or the approach works partially but a specific sub-problem remains unsolved.
 
 finish_task(status="blocked"):
-  No viable path forward. Use when: docker exec fails, no guest can make progress, the same error class repeats 3+ times, or you have exhausted meaningfully distinct approaches.
+  No viable path forward. Use when: tb fails, no guest can make progress, the same error class repeats 3+ times, or you have exhausted meaningfully distinct approaches.
 
 ## Hard limits
 - Do not run more than 2 fix-review cycles on the same issue. After 2 rounds, call finish_task with the current state.

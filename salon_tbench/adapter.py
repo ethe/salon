@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import shutil
 import subprocess
 import tempfile
 import time
@@ -12,6 +13,8 @@ from typing import Any
 
 from terminal_bench.agents.base_agent import AgentResult, BaseAgent, FailureMode
 from terminal_bench.terminal.tmux_session import TmuxSession
+
+from .broker import TerminalBroker
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +79,8 @@ class SalonAgent(BaseAgent):
                 task_file = tmpdir_path / "task.md"
                 result_file = tmpdir_path / "result.json"
                 salon_dir = tmpdir_path / "salon-runtime"
+                sock_path = tmpdir_path / "tb.sock"
+                shim_dir = tmpdir_path / "tb-shim"
                 run_id = uuid.uuid4().hex[:8]
                 salon_instance = f"tbench-{run_id}"
                 tmux_session_name = f"salon-{salon_instance}"
@@ -86,116 +91,129 @@ class SalonAgent(BaseAgent):
                 self._result_file = result_file
 
                 task_file.write_text(instruction, encoding="utf-8")
-                container_id = session.container.id
-                debug(f"container_id={container_id}")
                 debug(f"tmpdir={tmpdir_path}")
                 debug(f"tmux_session_name={tmux_session_name}")
+
+                repo_root = Path(__file__).resolve().parents[1]
+                debug(f"repo_root={repo_root}")
+
+                shim_dir.mkdir(parents=True, exist_ok=True)
+                tb_source = repo_root / "salon_tbench" / "tb"
+                tb_target = shim_dir / "tb"
+                shutil.copy2(tb_source, tb_target)
+                tb_target.chmod(0o755)
+                debug(f"tb_shim={tb_target}")
+
+                broker = TerminalBroker(session, str(sock_path))
+                broker.start()
+                debug(f"tb_broker_sock={sock_path}")
 
                 env = {
                     **os.environ,
                     "SALON_AUTONOMOUS": "1",
                     "SALON_TASK_FILE": str(task_file),
                     "SALON_RESULT_FILE": str(result_file),
-                    "SALON_CONTAINER_ID": str(container_id),
                     "SALON_DIR": str(salon_dir),
                     "SALON_INSTANCE": salon_instance,
+                    "SALON_TB_BRIDGE_SOCK": str(sock_path),
+                    "SALON_TB_SHIM_DIR": str(shim_dir),
                     "SALON_TMUX_SESSION": tmux_session_name,
                 }
-
-                repo_root = Path(__file__).resolve().parents[1]
-                debug(f"repo_root={repo_root}")
-                launcher = subprocess.Popen(
-                    ["node", "dist/main.js"],
-                    cwd=repo_root,
-                    env=env,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                debug(f"launcher_pid={launcher.pid}")
                 try:
-                    launcher.wait(timeout=120)
-                    debug(f"launcher_returncode={launcher.returncode}")
-                except subprocess.TimeoutExpired:
-                    launcher.kill()
-                    launcher.wait(timeout=5)
-                    debug("launcher timeout waiting for exit")
-                    return AgentResult(failure_mode=FailureMode.UNKNOWN_AGENT_ERROR)
+                    launcher = subprocess.Popen(
+                        ["node", "dist/main.js"],
+                        cwd=repo_root,
+                        env=env,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    debug(f"launcher_pid={launcher.pid}")
+                    try:
+                        launcher.wait(timeout=120)
+                        debug(f"launcher_returncode={launcher.returncode}")
+                    except subprocess.TimeoutExpired:
+                        launcher.kill()
+                        launcher.wait(timeout=5)
+                        debug("launcher timeout waiting for exit")
+                        return AgentResult(failure_mode=FailureMode.UNKNOWN_AGENT_ERROR)
 
-                configured_soft_timeout = int(os.environ.get("SALON_SOFT_TIMEOUT", str(self._soft_timeout_sec)))
-                soft_timeout = self._effective_soft_timeout()
-                debug(f"configured_soft_timeout={configured_soft_timeout}")
-                debug(f"completion_reserve_sec={self._completion_reserve_sec}")
-                debug(f"effective_soft_timeout={soft_timeout}")
-                started_at = time.time()
-                host_missing_since: float | None = None
-                last_snapshot_time = started_at
-                host_turn_count = 0
-                while True:
-                    if result_file.exists():
-                        debug(f"result_file exists={result_file}")
-                        try:
-                            debug(f"result_file contents={result_file.read_text(encoding='utf-8')}")
-                        except Exception as exc:
-                            debug(f"failed to read result_file: {exc}")
-                        return self._parse_result(result_file)
-                    if not self._host_pane_alive():
-                        now = time.time()
-                        if host_missing_since is None:
-                            host_missing_since = now
-                            logger.warning("host pane not detected, starting 30s grace period")
-                            debug(f"host pane missing target={self._read_host_pane_target()}")
-                            debug(f"host_pane_file_exists={self._host_pane_file.exists() if self._host_pane_file else False}")
-                        elif now - host_missing_since > 30 and not self._salon_session_alive():
-                            session_check = subprocess.run(
-                                ["tmux", "list-sessions", "-F", "#{session_name}"],
-                                capture_output=True,
-                                text=True,
-                                check=False,
-                            )
-                            debug(f"tmux_sessions={session_check.stdout.strip()}")
-                            usage = self._try_parse_session_logs(logging_dir)
-                            debug(f"recovered_usage={usage}")
-                            return self._agent_result_from_usage(
-                                usage=usage,
-                                failure_mode=FailureMode.UNKNOWN_AGENT_ERROR,
-                            )
-                    else:
-                        host_missing_since = None
-                    now = time.time()
-                    if now - last_snapshot_time >= 60:
-                        last_snapshot_time = now
-                        host_turn_count += 1
-                        host_pane_target = self._read_host_pane_target()
-                        if host_pane_target:
+                    configured_soft_timeout = int(os.environ.get("SALON_SOFT_TIMEOUT", str(self._soft_timeout_sec)))
+                    soft_timeout = self._effective_soft_timeout()
+                    debug(f"configured_soft_timeout={configured_soft_timeout}")
+                    debug(f"completion_reserve_sec={self._completion_reserve_sec}")
+                    debug(f"effective_soft_timeout={soft_timeout}")
+                    started_at = time.time()
+                    host_missing_since: float | None = None
+                    last_snapshot_time = started_at
+                    host_turn_count = 0
+                    while True:
+                        if result_file.exists():
+                            debug(f"result_file exists={result_file}")
                             try:
-                                snap = subprocess.run(
-                                    ["tmux", "capture-pane", "-t", host_pane_target, "-p"],
+                                debug(f"result_file contents={result_file.read_text(encoding='utf-8')}")
+                            except Exception as exc:
+                                debug(f"failed to read result_file: {exc}")
+                            return self._parse_result(result_file)
+                        if not self._host_pane_alive():
+                            now = time.time()
+                            if host_missing_since is None:
+                                host_missing_since = now
+                                logger.warning("host pane not detected, starting 30s grace period")
+                                debug(f"host pane missing target={self._read_host_pane_target()}")
+                                debug(f"host_pane_file_exists={self._host_pane_file.exists() if self._host_pane_file else False}")
+                            elif now - host_missing_since > 30 and not self._salon_session_alive():
+                                session_check = subprocess.run(
+                                    ["tmux", "list-sessions", "-F", "#{session_name}"],
                                     capture_output=True,
                                     text=True,
                                     check=False,
-                                ).stdout[-2000:]
-                                elapsed = int(now - started_at)
-                                logger.info("[t=%ss turn=%s] host pane snapshot:\n%s", elapsed, host_turn_count, snap)
-                                debug(f"[t={elapsed}s turn={host_turn_count}] host pane snapshot:\n{snap}")
-                            except Exception as exc:
-                                logger.warning("snapshot failed: %s", exc)
-                                debug(f"snapshot failed: {exc}")
-                    if time.time() - started_at > soft_timeout:
-                        debug("soft timeout reached; killing salon session")
-                        self._kill_salon_session()
-                        usage = self._try_parse_session_logs(logging_dir)
-                        debug(f"timeout_recovered_usage={usage}")
-                        timeout_result = self._agent_result_from_usage(
-                            usage=usage,
-                            failure_mode=FailureMode.AGENT_TIMEOUT,
-                        )
-                        debug(
-                            "timeout_result="
-                            f"input={timeout_result.total_input_tokens} "
-                            f"output={timeout_result.total_output_tokens}"
-                        )
-                        return timeout_result
-                    time.sleep(1)
+                                )
+                                debug(f"tmux_sessions={session_check.stdout.strip()}")
+                                usage = self._try_parse_session_logs(logging_dir)
+                                debug(f"recovered_usage={usage}")
+                                return self._agent_result_from_usage(
+                                    usage=usage,
+                                    failure_mode=FailureMode.UNKNOWN_AGENT_ERROR,
+                                )
+                        else:
+                            host_missing_since = None
+                        now = time.time()
+                        if now - last_snapshot_time >= 60:
+                            last_snapshot_time = now
+                            host_turn_count += 1
+                            host_pane_target = self._read_host_pane_target()
+                            if host_pane_target:
+                                try:
+                                    snap = subprocess.run(
+                                        ["tmux", "capture-pane", "-t", host_pane_target, "-p"],
+                                        capture_output=True,
+                                        text=True,
+                                        check=False,
+                                    ).stdout[-2000:]
+                                    elapsed = int(now - started_at)
+                                    logger.info("[t=%ss turn=%s] host pane snapshot:\n%s", elapsed, host_turn_count, snap)
+                                    debug(f"[t={elapsed}s turn={host_turn_count}] host pane snapshot:\n{snap}")
+                                except Exception as exc:
+                                    logger.warning("snapshot failed: %s", exc)
+                                    debug(f"snapshot failed: {exc}")
+                        if time.time() - started_at > soft_timeout:
+                            debug("soft timeout reached; killing salon session")
+                            self._kill_salon_session()
+                            usage = self._try_parse_session_logs(logging_dir)
+                            debug(f"timeout_recovered_usage={usage}")
+                            timeout_result = self._agent_result_from_usage(
+                                usage=usage,
+                                failure_mode=FailureMode.AGENT_TIMEOUT,
+                            )
+                            debug(
+                                "timeout_result="
+                                f"input={timeout_result.total_input_tokens} "
+                                f"output={timeout_result.total_output_tokens}"
+                            )
+                            return timeout_result
+                        time.sleep(1)
+                finally:
+                    broker.stop()
         except Exception:
             if logging_dir:
                 (logging_dir / "adapter_error.log").write_text(traceback.format_exc(), encoding="utf-8")
