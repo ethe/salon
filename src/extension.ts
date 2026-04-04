@@ -19,6 +19,12 @@ import { createConnection, createServer, type Server } from "node:net";
 import type { GuestRuntime, GuestStatus } from "./runtime.js";
 import { TmuxBackend } from "./tmux-backend.js";
 import {
+	createGuestQuantState,
+	resolveClaudeSessionLogPath,
+	updateGuestQuantState as parseGuestQuantState,
+	type GuestQuantState,
+} from "./session-parser.js";
+import {
 	type Discussion, type DiscussionStage, type DiscussionCommand,
 	type PersistedDiscussion, type PersistedDiscussionRound,
 	serializeDiscussion, deserializeDiscussion,
@@ -33,6 +39,7 @@ const TMUX_SESSION = process.env.SALON_TMUX_SESSION || `salon-${SALON_INSTANCE}`
 const SALON_STATE_ENTRY_TYPE = "salon_state";
 const SALON_STATE_VERSION = 1;
 const SALON_STATUS_MESSAGE_TYPE = "salon-status";
+const SALON_REPORT_REGEX = /\s*<SALON_REPORT>\s*\n?([\s\S]*?)<\/SALON_REPORT>\s*$/;
 type GuestType = "claude" | "codex";
 type GuestTeardownReason = "host" | "user";
 type GuestLifecycleStatus = "active" | "dismissing" | "suspended" | "dismissed";
@@ -66,6 +73,16 @@ interface GuestRuntimeHandle {
 
 type Guest = GuestRecord & GuestRuntimeHandle;
 
+interface ResolveDiscussionGuestOptions {
+	name?: string;
+	inviteType: GuestType;
+	expectedType?: GuestType;
+	activeGuests: Map<string, Guest>;
+	guestDiscussions: Map<string, string>;
+	getStatus: (guest: Guest) => string;
+	invite: (type: GuestType) => Guest;
+}
+
 interface Deferred<T> {
 	promise: Promise<T>;
 	resolve: (value: T | PromiseLike<T>) => void;
@@ -91,12 +108,88 @@ interface SalonStateSnapshot {
 	updatedAt: string;
 }
 
+interface AnthropicCacheControl {
+	type: string;
+	[key: string]: unknown;
+}
+
+interface AnthropicTextBlock {
+	type: "text";
+	text: string;
+	cache_control?: AnthropicCacheControl;
+}
+
+interface AnthropicImageBlock {
+	type: "image";
+	source: unknown;
+	cache_control?: AnthropicCacheControl;
+}
+
+interface AnthropicToolResultBlock {
+	type: "tool_result";
+	tool_use_id: string;
+	content: unknown;
+	is_error?: boolean;
+	cache_control?: AnthropicCacheControl;
+}
+
+type AnthropicCacheableBlock = AnthropicTextBlock | AnthropicImageBlock | AnthropicToolResultBlock;
+
+interface AnthropicOtherBlock {
+	type: string;
+	[key: string]: unknown;
+}
+
+type AnthropicContentBlock = AnthropicCacheableBlock | AnthropicOtherBlock;
+
+interface AnthropicMessagePayload {
+	role: string;
+	content: string | AnthropicContentBlock[];
+}
+
+interface AnthropicProviderPayload {
+	system: unknown[];
+	messages: AnthropicMessagePayload[];
+	[key: string]: unknown;
+}
+
+interface SalonReportNewRef {
+	kind: string;
+	op: string;
+	ref: string;
+	summary: string;
+}
+
+interface SalonReport {
+	newRefs: SalonReportNewRef[];
+	carryRefs: string[];
+}
+
+interface GuestRef {
+	id: string;
+	kind: string;
+	op: string;
+	summary: string;
+	firstSeen: number;
+	lastSeen: number;
+	freshness: "active" | "recent" | "historical";
+	confidence: "normal" | "stale";
+}
+
+interface GuestContextState {
+	refs: Map<string, GuestRef>;
+	consecutiveMissingReports: number;
+	totalResponses: number;
+}
+
 
 const guests = new Map<string, Guest>();
 const discussions = new Map<string, Discussion>();
 const archivedDiscussions = new Map<string, Discussion>();
 // Track which guest belongs to which discussion
 const guestToDiscussion = new Map<string, string>();
+const guestQuantStates = new Map<string, GuestQuantState>();
+const guestContextStates = new Map<string, GuestContextState>();
 const claimedSessionIds = new Set<string>();
 const activeCodexSessionScans = new Map<string, ReturnType<typeof setTimeout>>();
 const queuedGuestMessages = new Map<string, Array<{ message: string; from: string }>>();
@@ -110,6 +203,8 @@ const CODEX_SESSION_SCAN_INTERVAL_MS = 2000;
 const CODEX_SESSION_SCAN_TIMEOUT_MS = 30000;
 const CODEX_SESSION_SCAN_MAX_FIRST_LINE_BYTES = 16 * 1024;
 const SOCKET_PROBE_TIMEOUT_MS = 250;
+const GUEST_CONTEXT_RECENT_MS = 3 * 60 * 1000;
+const MAX_GUEST_CONTEXT_REFS = 50;
 const GUEST_NAME_POOL = [
 	"Euclid",
 	"Pythagoras",
@@ -238,6 +333,34 @@ function sanitizeGuestName(name: string): string {
 		throw new Error(`Invalid guest name '${name}'. Use only letters, numbers, dot, underscore, or dash.`);
 	}
 	return name;
+}
+
+function resolveDiscussionGuest(options: ResolveDiscussionGuestOptions): Guest {
+	if (!options.name) {
+		return options.invite(options.inviteType);
+	}
+
+	const name = sanitizeGuestName(options.name);
+	const guest = options.activeGuests.get(name);
+	if (!guest) {
+		throw new Error(`Guest '${name}' is not active in the salon. Only existing idle guests can be reused for discussions.`);
+	}
+	if (guest.lifecycleStatus !== "active") {
+		throw new Error(`Guest '${name}' is not active in the salon.`);
+	}
+	if (options.guestDiscussions.has(name)) {
+		throw new Error(`Guest '${name}' is already participating in another discussion.`);
+	}
+	if (options.expectedType && guest.type !== options.expectedType) {
+		throw new Error(`Guest '${name}' is type '${guest.type}', not '${options.expectedType}'.`);
+	}
+
+	const status = options.getStatus(guest);
+	if (status !== "idle") {
+		throw new Error(`Guest '${name}' is not idle (current status: ${status}).`);
+	}
+
+	return guest;
 }
 
 function getGeneratedGuestNameBase(name: string): string | undefined {
@@ -470,6 +593,25 @@ If the host assigns you a role for a task, treat it as a hard boundary until the
 - executor: implement the accepted plan and run relevant checks. Do not silently redefine the task. If the plan seems wrong or incomplete, report that to the host before deviating.
 - reviewer: review independently, report defects, and confirm fixes. Do not edit code unless the host explicitly reassigns you as executor.
 
+When responding to a host or agent message (prefixed with [name]:), append a context report at the very end of your response. This helps the host understand what you've loaded and worked on.
+
+Format — append at the very end, after all other content:
+<SALON_REPORT>
+new: <kind>:<op> <ref> — <one-line takeaway>
+carry: <ref>
+</SALON_REPORT>
+
+Rules:
+- "new" = references first used this turn, with a one-line summary of what you learned. Max 8.
+  - kind: file | search | url | cmd
+  - op: read | write | grep | glob | fetch | run
+  - ref: repo-relative path, search query, URL, or command summary
+- "carry" = references from prior turns you still actively relied on this turn. Max 5. Just the ref, no summary.
+- Only include refs actually consulted this turn. Do not invent references.
+- Keep summaries to ~12 words.
+- Omit the block entirely if you used no references (e.g., a short text-only answer).
+- Do not mention the report in your prose — it is machine-read metadata.
+
 If your role is unclear, ask the host to clarify before proceeding.`;
 
 function createCodexGuestNonce(): string {
@@ -479,6 +621,72 @@ function createCodexGuestNonce(): string {
 function buildGuestInstructions(name: string, nonce?: string): string {
 	const base = `Your name in this salon is ${name}.\n\n${GUEST_INSTRUCTIONS}`;
 	return nonce ? `${base}\n\n${nonce}` : base;
+}
+
+function splitSalonReportSummary(text: string): { head: string; summary: string } | undefined {
+	const emDashIndex = text.lastIndexOf(" — ");
+	if (emDashIndex >= 0) {
+		return {
+			head: text.slice(0, emDashIndex).trim(),
+			summary: text.slice(emDashIndex + 3).trim(),
+		};
+	}
+	const doubleDashIndex = text.lastIndexOf(" -- ");
+	if (doubleDashIndex >= 0) {
+		return {
+			head: text.slice(0, doubleDashIndex).trim(),
+			summary: text.slice(doubleDashIndex + 4).trim(),
+		};
+	}
+	return undefined;
+}
+
+function parseSalonReport(body: string): SalonReport {
+	const allowedKinds = new Set(["file", "search", "url", "cmd"]);
+	const allowedOps = new Set(["read", "write", "grep", "glob", "fetch", "run"]);
+	const report: SalonReport = { newRefs: [], carryRefs: [] };
+
+	for (const rawLine of body.split("\n")) {
+		const line = rawLine.trim();
+		if (!line) continue;
+		if (line.startsWith("new:")) {
+			const payload = line.slice("new:".length).trim();
+			const split = splitSalonReportSummary(payload);
+			if (!split || !split.summary) continue;
+			const match = /^([a-z]+):([a-z]+)\s+(.+)$/.exec(split.head);
+			if (!match) continue;
+			const [, kind, op, ref] = match;
+			if (!allowedKinds.has(kind) || !allowedOps.has(op)) continue;
+			const trimmedRef = ref.trim();
+			if (!trimmedRef) continue;
+			report.newRefs.push({
+				kind,
+				op,
+				ref: trimmedRef,
+				summary: split.summary,
+			});
+			continue;
+		}
+		if (line.startsWith("carry:")) {
+			const ref = line.slice("carry:".length).trim();
+			if (!ref) continue;
+			report.carryRefs.push(ref);
+		}
+	}
+
+	return report;
+}
+
+function stripSalonReport(content: string): { stripped: string; report?: SalonReport } {
+	const match = SALON_REPORT_REGEX.exec(content);
+	if (!match) {
+		return { stripped: content };
+	}
+	const body = match[1] || "";
+	return {
+		stripped: content.slice(0, match.index).trimEnd(),
+		report: parseSalonReport(body),
+	};
 }
 
 function normalizePath(path: string): string {
@@ -577,6 +785,7 @@ interface CodexSessionMetaEntry {
 
 interface CodexSessionScanCandidate {
 	sessionId: string;
+	filePath: string;
 	nonceMatched: boolean;
 	cwdMatched: boolean;
 	timestampDistanceMs: number;
@@ -622,6 +831,18 @@ function isBetterCodexSessionCandidate(
 		return next.timestampDistanceMs < current.timestampDistanceMs;
 	}
 	return next.sessionId < current.sessionId;
+}
+
+function resolveCodexSessionLogPath(sessionId: string, startedAt: number | undefined): string | undefined {
+	for (const sessionsDir of getCodexSessionDateDirs(startedAt)) {
+		if (!existsSync(sessionsDir)) continue;
+		for (const fileName of readdirSync(sessionsDir)) {
+			if (!/^rollout-.*\.jsonl$/.test(fileName)) continue;
+			if (!fileName.endsWith(`${sessionId}.jsonl`)) continue;
+			return join(sessionsDir, fileName);
+		}
+	}
+	return undefined;
 }
 
 function formatRecoveredSalonSummary(input: RecoveredSalonSummaryInput): string | undefined {
@@ -772,6 +993,8 @@ export default function salonExtension(pi: ExtensionAPI) {
 		incForwardTicketCounter: () => ++forwardTicketCounter,
 	};
 	let pendingResumeSummary: string | undefined;
+	let lastSalonStatusSnapshot: string | undefined;
+	let lastSalonStatusTimestamp: number | undefined;
 
 	pi.on("session_directory", () => {
 		mkdirSync(hostSessionDir, { recursive: true });
@@ -879,6 +1102,184 @@ export default function salonExtension(pi: ExtensionAPI) {
 		return trackedSessionId;
 	}
 
+	function ensureGuestQuantStateRecord(guest: GuestRecord): GuestQuantState {
+		let quantState = guestQuantStates.get(guest.name);
+		if (!quantState) {
+			quantState = createGuestQuantState();
+		}
+		if (!quantState.sessionLogPath && guest.sessionId) {
+			quantState.sessionLogPath = guest.type === "claude"
+				? resolveClaudeSessionLogPath(guest.sessionId, guest.workspaceDir)
+				: resolveCodexSessionLogPath(guest.sessionId, guest.startedAt);
+		}
+		guestQuantStates.set(guest.name, quantState);
+		return quantState;
+	}
+
+	function refreshGuestQuantState(guest: GuestRecord): GuestQuantState | undefined {
+		const quantState = ensureGuestQuantStateRecord(guest);
+		const updatedState = parseGuestQuantState(guest.type, quantState);
+		guestQuantStates.set(guest.name, updatedState);
+		if (updatedState.compactionCount > quantState.compactionCount) {
+			markGuestContextStale(guest.name);
+		}
+		return updatedState;
+	}
+
+	function formatCompactTokenCount(tokens: number): string {
+		if (tokens >= 1000) {
+			return `${Math.round(tokens / 1000)}k`;
+		}
+		return String(Math.round(tokens));
+	}
+
+	function formatGuestQuantSummary(state: GuestQuantState | undefined): string {
+		if (!state) return "";
+		const parts: string[] = [];
+		if (
+			state.lastTurnPromptTokens !== undefined &&
+			state.contextWindowSize !== undefined &&
+			state.contextUtilization !== undefined
+		) {
+			parts.push(
+				`~${Math.round(state.contextUtilization * 100)}% context (${formatCompactTokenCount(state.lastTurnPromptTokens)}/${formatCompactTokenCount(state.contextWindowSize)} tokens)`,
+			);
+		} else if (state.lastTurnPromptTokens !== undefined) {
+			parts.push(`~${formatCompactTokenCount(state.lastTurnPromptTokens)} prompt tokens`);
+		}
+		if (state.turnCount > 0) {
+			parts.push(`${state.turnCount} turn${state.turnCount === 1 ? "" : "s"}`);
+		}
+		if (state.compactionCount > 0) {
+			parts.push("⚠ compacted");
+		}
+		return parts.length > 0 ? `, ${parts.join(", ")}` : "";
+	}
+
+	function ensureGuestContextStateRecord(name: string): GuestContextState {
+		let contextState = guestContextStates.get(name);
+		if (!contextState) {
+			contextState = {
+				refs: new Map(),
+				consecutiveMissingReports: 0,
+				totalResponses: 0,
+			};
+			guestContextStates.set(name, contextState);
+		}
+		return contextState;
+	}
+
+	function refreshGuestContextFreshness(state: GuestContextState, now = Date.now()) {
+		for (const ref of state.refs.values()) {
+			if (ref.freshness === "recent" && now - ref.lastSeen > GUEST_CONTEXT_RECENT_MS) {
+				ref.freshness = "historical";
+			}
+		}
+	}
+
+	function pruneGuestContextRefs(state: GuestContextState) {
+		if (state.refs.size <= MAX_GUEST_CONTEXT_REFS) return;
+		const historicalRefs = Array.from(state.refs.values())
+			.filter((ref) => ref.freshness === "historical")
+			.sort((a, b) => a.lastSeen - b.lastSeen);
+		for (const ref of historicalRefs) {
+			if (state.refs.size <= MAX_GUEST_CONTEXT_REFS) break;
+			state.refs.delete(ref.id);
+		}
+	}
+
+	function updateGuestContextState(name: string, report: SalonReport) {
+		const now = Date.now();
+		const contextState = ensureGuestContextStateRecord(name);
+		refreshGuestContextFreshness(contextState, now);
+		for (const ref of contextState.refs.values()) {
+			if (ref.freshness === "active") {
+				ref.freshness = "recent";
+			}
+		}
+
+		for (const nextRef of report.newRefs.slice(0, 8)) {
+			const existing = contextState.refs.get(nextRef.ref);
+			const firstSeen = existing?.firstSeen ?? now;
+			contextState.refs.set(nextRef.ref, {
+				id: nextRef.ref,
+				kind: nextRef.kind,
+				op: nextRef.op,
+				summary: nextRef.summary,
+				firstSeen,
+				lastSeen: now,
+				freshness: "active",
+				confidence: "normal",
+			});
+		}
+
+		for (const carryRef of report.carryRefs.slice(0, 5)) {
+			const existing = contextState.refs.get(carryRef);
+			if (existing) {
+				existing.lastSeen = now;
+				existing.freshness = "active";
+				existing.confidence = "normal";
+				continue;
+			}
+			contextState.refs.set(carryRef, {
+				id: carryRef,
+				kind: "unknown",
+				op: "carry",
+				summary: "",
+				firstSeen: now,
+				lastSeen: now,
+				freshness: "active",
+				confidence: "normal",
+			});
+		}
+
+		pruneGuestContextRefs(contextState);
+	}
+
+	function trackGuestReportPresence(name: string | undefined, hasReport: boolean) {
+		if (!name) return;
+		const contextState = ensureGuestContextStateRecord(name);
+		contextState.totalResponses += 1;
+		contextState.consecutiveMissingReports = hasReport ? 0 : contextState.consecutiveMissingReports + 1;
+	}
+
+	function markGuestContextStale(name: string) {
+		const contextState = guestContextStates.get(name);
+		if (!contextState) return;
+		for (const ref of contextState.refs.values()) {
+			ref.confidence = "stale";
+		}
+	}
+
+	function getGuestContextStatusLines(name: string): string[] {
+		const contextState = guestContextStates.get(name);
+		if (!contextState) return [];
+		refreshGuestContextFreshness(contextState);
+
+		const lines: string[] = [];
+		const activeRefs = Array.from(contextState.refs.values())
+			.filter((ref) => ref.freshness === "active")
+			.sort((a, b) => b.lastSeen - a.lastSeen)
+			.slice(0, 3);
+		if (activeRefs.length > 0) {
+			const activeLabel = activeRefs
+				.map((ref) => ref.summary ? `${ref.id} (${ref.summary})` : ref.id)
+				.join(", ");
+			lines.push(`    active: ${activeLabel}`);
+		}
+
+		if (contextState.consecutiveMissingReports >= 3) {
+			lines.push(`    warning: report missing ×${contextState.consecutiveMissingReports}`);
+		}
+
+		const staleCount = Array.from(contextState.refs.values()).filter((ref) => ref.confidence === "stale").length;
+		if (staleCount > 0) {
+			lines.push(`    warning: ${staleCount} refs stale after compaction`);
+		}
+
+		return lines;
+	}
+
 	function activateGuestLifecycle(
 		guest: Guest,
 		options: { dropDismissedRecord?: boolean; reactivateArchivedDiscussions?: boolean; persist?: boolean } = {},
@@ -894,6 +1295,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 			claimedSessionIds.add(guest.sessionId);
 		}
 		queuedGuestMessages.delete(guest.name);
+		ensureGuestQuantStateRecord(guest);
 		writeGuestRuntimeFile(guest);
 		if (options.reactivateArchivedDiscussions) {
 			reactivateArchivedDiscussions();
@@ -953,6 +1355,8 @@ export default function salonExtension(pi: ExtensionAPI) {
 			}
 			const inactiveGuest = buildInactiveGuestRecord(activeGuest);
 			guests.delete(name);
+			guestQuantStates.delete(name);
+			guestContextStates.delete(name);
 			dismissedGuests.set(name, inactiveGuest);
 			queuedGuestMessages.delete(name);
 			removeGuestFromDiscussion(name);
@@ -971,6 +1375,8 @@ export default function salonExtension(pi: ExtensionAPI) {
 		}
 		cancelCodexSessionScan(name);
 		clearGuestForwardState(salonDir, name);
+		guestQuantStates.delete(name);
+		guestContextStates.delete(name);
 		trackGuestSessionId(inactiveRecord, sessionId, { writeRuntimeFile: false, force: !!sessionId && !inactiveRecord.sessionId });
 		if (persist) {
 			persistSalonState();
@@ -990,7 +1396,8 @@ export default function salonExtension(pi: ExtensionAPI) {
 			for (const fileName of readdirSync(sessionsDir)) {
 				if (!/^rollout-.*\.jsonl$/.test(fileName)) continue;
 
-				const firstLine = readFirstLine(join(sessionsDir, fileName));
+				const filePath = join(sessionsDir, fileName);
+				const firstLine = readFirstLine(filePath);
 				if (!firstLine) continue;
 
 				try {
@@ -1012,6 +1419,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 
 					const candidate: CodexSessionScanCandidate = {
 						sessionId,
+						filePath,
 						nonceMatched: Boolean(guest.nonce && baseInstructionsText?.includes(guest.nonce)),
 						cwdMatched: Boolean(payloadCwd && normalizePath(payloadCwd) === normalizedWorkDir),
 						timestampDistanceMs: Number.isFinite(timestampMs) && guest.startedAt !== undefined
@@ -1061,6 +1469,10 @@ export default function salonExtension(pi: ExtensionAPI) {
 			const candidate = findCodexSessionCandidate(trackedGuest, normalizePath(trackedGuest.workspaceDir));
 			if (candidate) {
 				claimGuestSessionId(trackedGuest, candidate.sessionId);
+				if (guests.has(trackedGuest.name)) {
+					const quantState = ensureGuestQuantStateRecord(trackedGuest);
+					guestQuantStates.set(trackedGuest.name, { ...quantState, sessionLogPath: candidate.filePath });
+				}
 				return;
 			}
 
@@ -1136,6 +1548,8 @@ export default function salonExtension(pi: ExtensionAPI) {
 		discussions.clear();
 		archivedDiscussions.clear();
 		guestToDiscussion.clear();
+		guestQuantStates.clear();
+		guestContextStates.clear();
 		claimedSessionIds.clear();
 		activeCodexSessionScans.clear();
 		queuedGuestMessages.clear();
@@ -1340,7 +1754,9 @@ export default function salonExtension(pi: ExtensionAPI) {
 			const discId = guestToDiscussion.get(guest.name);
 			const disc = discId ? discussions.get(discId) : undefined;
 			const discLabel = disc ? ` [discussing: ${disc.stage}]` : "";
-			lines.push(`  ${guest.name} (${guest.type}): ${status}${discLabel}`);
+			const quantLabel = formatGuestQuantSummary(refreshGuestQuantState(guest));
+			lines.push(`  ${guest.name} (${guest.type}): ${status}${discLabel}${quantLabel}`);
+			lines.push(...getGuestContextStatusLines(guest.name));
 		}
 		for (const guest of dismissedGuests.values()) {
 			if (guest.lifecycleStatus !== "suspended") continue;
@@ -1354,14 +1770,83 @@ export default function salonExtension(pi: ExtensionAPI) {
 		return message.role === "custom" && message.customType === SALON_STATUS_MESSAGE_TYPE;
 	}
 
-	function createSalonStatusContextMessage(snapshot: string): AgentMessage {
+	function createSalonStatusContextMessage(snapshot: string, timestamp = Date.now()): AgentMessage {
 		return {
 			role: "custom",
 			customType: SALON_STATUS_MESSAGE_TYPE,
 			content: snapshot,
 			display: false,
-			timestamp: Date.now(),
+			timestamp,
 		};
+	}
+
+	function isAnthropicProviderPayload(payload: unknown): payload is AnthropicProviderPayload {
+		if (typeof payload !== "object" || payload === null) return false;
+		const candidate = payload as { system?: unknown; messages?: unknown };
+		return Array.isArray(candidate.system) && Array.isArray(candidate.messages);
+	}
+
+	function isAnthropicTextBlock(block: AnthropicContentBlock): block is AnthropicTextBlock {
+		return block.type === "text" && typeof (block as { text?: unknown }).text === "string";
+	}
+
+	function isAnthropicCacheableBlock(block: AnthropicContentBlock): block is AnthropicCacheableBlock {
+		return block.type === "text" || block.type === "image" || block.type === "tool_result";
+	}
+
+	function getAnthropicSalonStatusTextBlock(message: AnthropicMessagePayload): AnthropicTextBlock | undefined {
+		if (message.role !== "user" || !Array.isArray(message.content) || message.content.length !== 1) {
+			return undefined;
+		}
+		const [block] = message.content;
+		if (!isAnthropicTextBlock(block) || !block.text.startsWith("[salon-status]")) {
+			return undefined;
+		}
+		return block;
+	}
+
+	function getLastAnthropicCacheableUserBlock(message: AnthropicMessagePayload): AnthropicCacheableBlock | undefined {
+		if (message.role !== "user") return undefined;
+		if (typeof message.content === "string") {
+			const block: AnthropicTextBlock = {
+				type: "text",
+				text: message.content,
+			};
+			message.content = [block];
+			return block;
+		}
+		for (let i = message.content.length - 1; i >= 0; i--) {
+			const block = message.content[i];
+			if (isAnthropicCacheableBlock(block)) {
+				return block;
+			}
+		}
+		return undefined;
+	}
+
+	function retargetAnthropicSalonStatusCacheBreakpoint(payload: unknown): unknown {
+		if (!isAnthropicProviderPayload(payload) || payload.messages.length === 0) {
+			return payload;
+		}
+		const lastMessage = payload.messages[payload.messages.length - 1];
+		const salonStatusBlock = getAnthropicSalonStatusTextBlock(lastMessage);
+		if (!salonStatusBlock?.cache_control) {
+			return payload;
+		}
+		const cacheControl = salonStatusBlock.cache_control;
+		delete salonStatusBlock.cache_control;
+		for (let i = payload.messages.length - 2; i >= 0; i--) {
+			const message = payload.messages[i];
+			if (message.role !== "user" || getAnthropicSalonStatusTextBlock(message)) {
+				continue;
+			}
+			const block = getLastAnthropicCacheableUserBlock(message);
+			if (!block) continue;
+			block.cache_control = cacheControl;
+			return payload;
+		}
+		salonStatusBlock.cache_control = cacheControl;
+		return payload;
 	}
 
 	function resumeInactiveGuest(name: string): Guest {
@@ -1507,51 +1992,62 @@ export default function salonExtension(pi: ExtensionAPI) {
 		name: "discuss",
 		label: "Start Discussion",
 		description:
-			"Start a structured discussion on a topic. Invites two guests (default: one Claude Code + one Codex CLI for diverse perspectives) " +
+			"Start a structured discussion on a topic. Reuses specified idle guests or invites two guests (default: one Claude Code + one Codex CLI for diverse perspectives) " +
 			"who independently explore the topic, then cross-review each other's proposals. The host synthesizes at the end.",
 		promptSnippet: "Start a structured discussion between two guests (default: claude + codex for cognitive diversity)",
 		promptGuidelines: [
 			"Use discuss for open-ended questions: architecture, design decisions, migration strategies, planning",
 			"Default to discuss over answering alone for questions where you're not fully certain or where tradeoffs are non-obvious",
 			"Discussions use one claude + one codex by default — different models produce genuinely different perspectives. Override only when there's a reason.",
+			"Reuse an existing idle guest by passing guest_a_name or guest_b_name when they already have the right context.",
 			"After the discussion completes, synthesize the proposals and reviews into a final recommendation",
 		],
 		parameters: Type.Object({
 			topic: Type.String({ description: "Brief topic label for tracking the discussion" }),
 			message: Type.String({ description: "The message to send to both guests — describe the task, provide context, ask the question. You decide how to frame it." }),
 			guest_a_type: Type.Optional(Type.Union([Type.Literal("claude"), Type.Literal("codex")], {
-				description: "Type for guest A (default: claude)",
+				description: "Type for guest A when inviting a new guest (default: claude), or expected type when reusing an existing guest",
 			})),
 			guest_b_type: Type.Optional(Type.Union([Type.Literal("claude"), Type.Literal("codex")], {
-				description: "Type for guest B (default: codex)",
+				description: "Type for guest B when inviting a new guest (default: codex), or expected type when reusing an existing guest",
 			})),
-			guest_a_name: Type.Optional(Type.String({ description: "Name for guest A (default: auto-generated)" })),
-			guest_b_name: Type.Optional(Type.String({ description: "Name for guest B (default: auto-generated)" })),
+			guest_a_name: Type.Optional(Type.String({ description: "Existing idle guest to reuse for guest A" })),
+			guest_b_name: Type.Optional(Type.String({ description: "Existing idle guest to reuse for guest B" })),
 		}),
 		async execute(_id, params: any) {
-			const typeA = params.guest_a_type || "claude";
-			const typeB = params.guest_b_type || "codex";
+			const requestedTypeA = typeof params.guest_a_type === "string" ? params.guest_a_type as GuestType : undefined;
+			const requestedTypeB = typeof params.guest_b_type === "string" ? params.guest_b_type as GuestType : undefined;
+			const typeA = requestedTypeA || "claude";
+			const typeB = requestedTypeB || "codex";
 			const discId = `disc_${Date.now()}`;
 
-			// Invite both guests — heterogeneous by default
-			const guestA = activateGuestLifecycle(inviteGuest(
-				typeof params.guest_a_name === "string" ? params.guest_a_name : undefined,
-				typeA,
-				workDir,
-				salonDir,
-				guestDir,
-				runtime,
-			));
-			const guestB = activateGuestLifecycle(inviteGuest(
-				typeof params.guest_b_name === "string" ? params.guest_b_name : undefined,
-				typeB,
-				workDir,
-				salonDir,
-				guestDir,
-				runtime,
-			));
-			scanCodexSessionId(guestA);
-			scanCodexSessionId(guestB);
+			const inviteDiscussionGuest = (type: GuestType): Guest => {
+				const guest = activateGuestLifecycle(inviteGuest(undefined, type, workDir, salonDir, guestDir, runtime));
+				scanCodexSessionId(guest);
+				return guest;
+			};
+
+			const guestA = resolveDiscussionGuest({
+				name: typeof params.guest_a_name === "string" ? params.guest_a_name : undefined,
+				inviteType: typeA,
+				expectedType: requestedTypeA,
+				activeGuests: guests,
+				guestDiscussions: guestToDiscussion,
+				getStatus: getGuestDisplayStatus,
+				invite: inviteDiscussionGuest,
+			});
+			const guestB = resolveDiscussionGuest({
+				name: typeof params.guest_b_name === "string" ? params.guest_b_name : undefined,
+				inviteType: typeB,
+				expectedType: requestedTypeB,
+				activeGuests: guests,
+				guestDiscussions: guestToDiscussion,
+				getStatus: getGuestDisplayStatus,
+				invite: inviteDiscussionGuest,
+			});
+			if (guestA.name === guestB.name) {
+				throw new Error(`Discussion requires two distinct guests. '${guestA.name}' was selected twice.`);
+			}
 			const nameA = guestA.name;
 			const nameB = guestB.name;
 
@@ -2077,10 +2573,20 @@ When these appear, process them thoughtfully — don't just echo them to the use
 		const messages = event.messages.filter((message) => !isSalonStatusContextMessage(message));
 		const salonStatusSnapshot = buildSalonStatusSnapshot();
 		if (!salonStatusSnapshot) {
+			lastSalonStatusSnapshot = undefined;
+			lastSalonStatusTimestamp = undefined;
 			return { messages };
 		}
-		messages.push(createSalonStatusContextMessage(salonStatusSnapshot));
+		if (salonStatusSnapshot !== lastSalonStatusSnapshot || lastSalonStatusTimestamp === undefined) {
+			lastSalonStatusSnapshot = salonStatusSnapshot;
+			lastSalonStatusTimestamp = Date.now();
+		}
+		messages.push(createSalonStatusContextMessage(salonStatusSnapshot, lastSalonStatusTimestamp));
 		return { messages };
+	});
+
+	pi.on("before_provider_request", (event) => {
+		return retargetAnthropicSalonStatusCacheBreakpoint(event.payload);
 	});
 
 	// ── Receive guest responses via Unix socket ──────────────────────
@@ -2185,11 +2691,19 @@ When these appear, process them thoughtfully — don't just echo them to the use
 			}
 
 			const respondingGuest = guests.get(msg.from);
-			if (respondingGuest) respondingGuest.eventStatus = "idle";
+			const { stripped: cleanContent, report } = stripSalonReport(msg.content);
+			if (respondingGuest) {
+				respondingGuest.eventStatus = "idle";
+				refreshGuestQuantState(respondingGuest);
+				if (report) {
+					updateGuestContextState(respondingGuest.name, report);
+				}
+			}
+			trackGuestReportPresence(respondingGuest?.name, !!report);
 
-			const handled = handleDiscussionMessage(msg.from, msg.content);
+			const handled = handleDiscussionMessage(msg.from, cleanContent);
 			if (!handled) {
-				pi.sendUserMessage(`[${msg.from}]: ${msg.content}`, { deliverAs: "followUp" });
+				pi.sendUserMessage(`[${msg.from}]: ${cleanContent}`, { deliverAs: "followUp" });
 			}
 		});
 		ownsMessageSocket = true;
@@ -2310,9 +2824,11 @@ export const __test__ = {
 	getGuestForwardArmedPath,
 	createGuestForwardTicket,
 	clearGuestForwardState,
+	resolveDiscussionGuest,
 	sayToGuestImpl,
 	flushQueuedGuestMessagesImpl,
 	startMessageServer,
 	guests,
+	guestToDiscussion,
 	queuedGuestMessages,
 };

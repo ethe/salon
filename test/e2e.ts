@@ -680,10 +680,142 @@ console.log("\n== 17. invite_guest + sayToGuest(initial_message) → queue → f
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// == 18. generateSalonInstance determinism ==
+console.log("\n== 18. resolveDiscussionGuest reuses existing idle guests ==");
+{
+	const { resolveDiscussionGuest, guests, guestToDiscussion } = extensionTest;
+	guests.clear();
+	guestToDiscussion.clear();
+
+	const reusableGuest = {
+		name: "reuse-me",
+		type: "claude" as const,
+		runtimeId: "%reuse",
+		sessionId: "sess-reuse",
+		startedAt: Date.now(),
+		lifecycleStatus: "active" as const,
+		workspaceDir: "/tmp",
+		ready: true,
+		eventStatus: "idle" as const,
+	};
+	guests.set(reusableGuest.name, reusableGuest);
+
+	const invitedGuest = {
+		name: "fresh-codex",
+		type: "codex" as const,
+		runtimeId: "%fresh",
+		startedAt: Date.now(),
+		lifecycleStatus: "active" as const,
+		workspaceDir: "/tmp",
+		ready: false,
+	};
+	const invitedTypes: string[] = [];
+	const invite = (type: "claude" | "codex") => {
+		invitedTypes.push(type);
+		return invitedGuest;
+	};
+
+	const reused = resolveDiscussionGuest({
+		name: reusableGuest.name,
+		inviteType: "codex",
+		activeGuests: guests,
+		guestDiscussions: guestToDiscussion,
+		getStatus: () => "idle",
+		invite,
+	});
+	assert("Existing idle guest is reused", reused === reusableGuest);
+	assert("Reusing an idle guest does not invite a new guest", invitedTypes.length === 0);
+
+	let missingGuestError = "";
+	try {
+		resolveDiscussionGuest({
+			name: "missing-guest",
+			inviteType: "claude",
+			activeGuests: guests,
+			guestDiscussions: guestToDiscussion,
+			getStatus: () => "idle",
+			invite,
+		});
+	} catch (error) {
+		missingGuestError = error instanceof Error ? error.message : String(error);
+	}
+	assert("Missing guest name is rejected as not active", missingGuestError.includes("not active"));
+
+	const reusedWithoutExpectedType = resolveDiscussionGuest({
+		name: reusableGuest.name,
+		inviteType: "codex",
+		activeGuests: guests,
+		guestDiscussions: guestToDiscussion,
+		getStatus: () => "idle",
+		invite,
+	});
+	assert("Omitting expectedType skips type checking", reusedWithoutExpectedType === reusableGuest);
+
+	const invited = resolveDiscussionGuest({
+		inviteType: "codex",
+		activeGuests: guests,
+		guestDiscussions: guestToDiscussion,
+		getStatus: () => "idle",
+		invite,
+	});
+	assert("Missing name invites a new guest", invited === invitedGuest);
+	assert("Invite path uses the requested guest type", invitedTypes[0] === "codex");
+
+	let busyError = "";
+	try {
+		resolveDiscussionGuest({
+			name: reusableGuest.name,
+			inviteType: "claude",
+			activeGuests: guests,
+			guestDiscussions: guestToDiscussion,
+			getStatus: () => "working",
+			invite,
+		});
+	} catch (error) {
+		busyError = error instanceof Error ? error.message : String(error);
+	}
+	assert("Non-idle guest reuse is rejected", busyError.includes("not idle"));
+
+	guestToDiscussion.set(reusableGuest.name, "disc-existing");
+	let discussingError = "";
+	try {
+		resolveDiscussionGuest({
+			name: reusableGuest.name,
+			inviteType: "claude",
+			activeGuests: guests,
+			guestDiscussions: guestToDiscussion,
+			getStatus: () => "idle",
+			invite,
+		});
+	} catch (error) {
+		discussingError = error instanceof Error ? error.message : String(error);
+	}
+	assert("Guest already in a discussion cannot be reused", discussingError.includes("already participating"));
+
+	let typeMismatchError = "";
+	try {
+		resolveDiscussionGuest({
+			name: reusableGuest.name,
+			inviteType: "claude",
+			expectedType: "codex",
+			activeGuests: guests,
+			guestDiscussions: new Map<string, string>(),
+			getStatus: () => "idle",
+			invite,
+		});
+	} catch (error) {
+		typeMismatchError = error instanceof Error ? error.message : String(error);
+	}
+	assert("Explicit guest type mismatch is rejected", typeMismatchError.includes("not 'codex'"));
+
+	guests.clear();
+	guestToDiscussion.clear();
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// == 19. generateSalonInstance determinism ==
 {
 	const { generateSalonInstance } = await import("../src/instance.ts");
-	console.log(`\n== 18. generateSalonInstance determinism ==`);
+	console.log(`\n== 19. generateSalonInstance determinism ==`);
 
 	const a1 = generateSalonInstance("/Users/test/my-project");
 	const a2 = generateSalonInstance("/Users/test/my-project");
