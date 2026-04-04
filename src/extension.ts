@@ -2726,7 +2726,11 @@ Guests must NOT use their native Read, Edit, Grep, or Bash tools on the host fil
 If docker exec fails with "No such container" or "is not running", call finish_task(status="blocked") immediately — the environment is broken.
 
 ## Workflow
-1. Invite 1-2 available guests. Brief each with the full task description, container ID (${SALON_CONTAINER_ID}), and the docker exec constraint.
+1. Always invite EXACTLY 2 guests: one Claude Code guest and one Codex guest.
+   - During planning: both agents explore the problem independently, then you synthesize.
+   - During execution: assign one as executor, the other as reviewer/verifier.
+   - Do NOT proceed with only one guest — cross-model collaboration is required.
+   - If a guest fails to start, retry once; if still unavailable, call finish_task(blocked).
 2. For tasks requiring design: use discuss, then assign executor + reviewer.
 3. For straightforward tasks: assign one guest as executor, other as reviewer.
 4. After execution: have the reviewer verify inside the container (run tests, check output files, inspect results).
