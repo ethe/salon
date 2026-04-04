@@ -35,6 +35,24 @@ class SalonAgent(BaseAgent):
     def name() -> str:
         return "salon"
 
+    def _effective_soft_timeout(self) -> int:
+        configured_timeout = int(os.environ.get("SALON_SOFT_TIMEOUT", str(self._soft_timeout_sec)))
+        return max(1, configured_timeout - self._completion_reserve_sec)
+
+    def _agent_result_from_usage(
+        self,
+        usage: dict[str, int] | None,
+        failure_mode: FailureMode,
+    ) -> AgentResult:
+        usage_data = usage or {}
+        total_input_tokens = int(usage_data.get("total_input_tokens", 0) or 0)
+        total_output_tokens = int(usage_data.get("total_output_tokens", 0) or 0)
+        return AgentResult(
+            total_input_tokens=total_input_tokens,
+            total_output_tokens=total_output_tokens,
+            failure_mode=failure_mode,
+        )
+
     def perform_task(
         self,
         instruction: str,
@@ -103,7 +121,11 @@ class SalonAgent(BaseAgent):
                     debug("launcher timeout waiting for exit")
                     return AgentResult(failure_mode=FailureMode.UNKNOWN_AGENT_ERROR)
 
-                soft_timeout = int(os.environ.get("SALON_SOFT_TIMEOUT", str(self._soft_timeout_sec)))
+                configured_soft_timeout = int(os.environ.get("SALON_SOFT_TIMEOUT", str(self._soft_timeout_sec)))
+                soft_timeout = self._effective_soft_timeout()
+                debug(f"configured_soft_timeout={configured_soft_timeout}")
+                debug(f"completion_reserve_sec={self._completion_reserve_sec}")
+                debug(f"effective_soft_timeout={soft_timeout}")
                 started_at = time.time()
                 host_missing_since: float | None = None
                 last_snapshot_time = started_at
@@ -133,9 +155,8 @@ class SalonAgent(BaseAgent):
                             debug(f"tmux_sessions={session_check.stdout.strip()}")
                             usage = self._try_parse_session_logs(logging_dir)
                             debug(f"recovered_usage={usage}")
-                            return AgentResult(
-                                total_input_tokens=usage["total_input_tokens"],
-                                total_output_tokens=usage["total_output_tokens"],
+                            return self._agent_result_from_usage(
+                                usage=usage,
                                 failure_mode=FailureMode.UNKNOWN_AGENT_ERROR,
                             )
                     else:
@@ -164,11 +185,16 @@ class SalonAgent(BaseAgent):
                         self._kill_salon_session()
                         usage = self._try_parse_session_logs(logging_dir)
                         debug(f"timeout_recovered_usage={usage}")
-                        return AgentResult(
-                            total_input_tokens=usage["total_input_tokens"],
-                            total_output_tokens=usage["total_output_tokens"],
+                        timeout_result = self._agent_result_from_usage(
+                            usage=usage,
                             failure_mode=FailureMode.AGENT_TIMEOUT,
                         )
+                        debug(
+                            "timeout_result="
+                            f"input={timeout_result.total_input_tokens} "
+                            f"output={timeout_result.total_output_tokens}"
+                        )
+                        return timeout_result
                     time.sleep(1)
         except Exception:
             if logging_dir:

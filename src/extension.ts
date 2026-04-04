@@ -2725,16 +2725,29 @@ Guests must NOT use their native Read, Edit, Grep, or Bash tools on the host fil
 
 If docker exec fails with "No such container" or "is not running", call finish_task(status="blocked") immediately — the environment is broken.
 
+## Capability preflight (run before assigning roles)
+Each guest must verify container access AND write capability:
+  docker exec ${SALON_CONTAINER_ID} bash -c 'echo ok > /tmp/__salon_probe && rm /tmp/__salon_probe' 2>&1 || \\
+  sudo docker exec ${SALON_CONTAINER_ID} bash -c 'echo ok > /tmp/__salon_probe && rm /tmp/__salon_probe' 2>&1
+
+If a guest fails this check, do NOT assign them container write tasks.
+Reassign them to analysis/planning/review only.
+If BOTH guests fail: call finish_task(blocked) immediately.
+
 ## Workflow
-1. Always invite EXACTLY 2 guests: one Claude Code guest and one Codex guest.
-   - During planning: both agents explore the problem independently, then you synthesize.
-   - During execution: assign one as executor, the other as reviewer/verifier.
-   - Do NOT proceed with only one guest — cross-model collaboration is required.
-   - If a guest fails to start, retry once; if still unavailable, call finish_task(blocked).
+1. Always invite 2 guests: one Claude Code guest and one Codex guest.
+   Run capability preflight for both. Then:
+   - If both pass: assign one as executor, one as reviewer.
+   - If one fails: assign the failing guest to analysis/planning only; the other handles all container writes.
+   - If both fail: call finish_task(blocked) immediately.
+   Do NOT let a blocked guest occupy executor slot while doing nothing.
 2. For tasks requiring design: use discuss, then assign executor + reviewer.
 3. For straightforward tasks: assign one guest as executor, other as reviewer.
-4. After execution: have the reviewer verify inside the container (run tests, check output files, inspect results).
-5. Call finish_task based on verification outcome.
+4. Artifact-first: For tasks requiring output files, write a best-effort version
+   to the target path within the first 3-4 docker exec rounds, then iterate.
+   A partial /app/output.npy that exists beats a perfect analysis that never gets written.
+5. After execution: have the reviewer verify inside the container (run tests, check output files, inspect results).
+6. Call finish_task based on verification outcome.
 
 ## Reviewer acceptance checklist
 Before approving, verify ALL acceptance criteria:
@@ -2744,6 +2757,11 @@ Before approving, verify ALL acceptance criteria:
 3. For tasks requiring "unchanged" output (e.g., filtering, transformation),
    verify the unchanged-input invariant holds on a sample of clean inputs
 4. Do NOT only validate the specific cases you designed — validate what the benchmark validates
+5. For tasks involving extraction, inference, or learning:
+   - Do NOT validate only against the visible instance (e.g., visible forward.py, visible weights)
+   - Test with at least one alternative input (different seed, shape, or data)
+   - Verify output dimensions/schema match the task contract, not just the currently visible example
+   - A solution that only works on what you can see is NOT a solution
 
 ## Termination — call finish_task promptly
 
