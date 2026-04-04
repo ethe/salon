@@ -103,14 +103,14 @@ class SalonAgent(BaseAgent):
                     debug("launcher timeout waiting for exit")
                     return AgentResult(failure_mode=FailureMode.UNKNOWN_AGENT_ERROR)
 
-                    soft_timeout = int(os.environ.get("SALON_SOFT_TIMEOUT", str(self._soft_timeout_sec)))
-                    started_at = time.time()
-                    host_missing_since: float | None = None
-                    last_snapshot_time = started_at
-                    host_turn_count = 0
-                    while True:
-                        if result_file.exists():
-                            debug(f"result_file exists={result_file}")
+                soft_timeout = int(os.environ.get("SALON_SOFT_TIMEOUT", str(self._soft_timeout_sec)))
+                started_at = time.time()
+                host_missing_since: float | None = None
+                last_snapshot_time = started_at
+                host_turn_count = 0
+                while True:
+                    if result_file.exists():
+                        debug(f"result_file exists={result_file}")
                         try:
                             debug(f"result_file contents={result_file.read_text(encoding='utf-8')}")
                         except Exception as exc:
@@ -138,29 +138,29 @@ class SalonAgent(BaseAgent):
                                 total_output_tokens=usage["total_output_tokens"],
                                 failure_mode=FailureMode.UNKNOWN_AGENT_ERROR,
                             )
-                        else:
-                            host_missing_since = None
-                        now = time.time()
-                        if now - last_snapshot_time >= 60:
-                            last_snapshot_time = now
-                            host_turn_count += 1
-                            host_pane_target = self._read_host_pane_target()
-                            if host_pane_target:
-                                try:
-                                    snap = subprocess.run(
-                                        ["tmux", "capture-pane", "-t", host_pane_target, "-p"],
-                                        capture_output=True,
-                                        text=True,
-                                        check=False,
-                                    ).stdout[-2000:]
-                                    elapsed = int(now - started_at)
-                                    logger.info("[t=%ss turn=%s] host pane snapshot:\n%s", elapsed, host_turn_count, snap)
-                                    debug(f"[t={elapsed}s turn={host_turn_count}] host pane snapshot:\n{snap}")
-                                except Exception as exc:
-                                    logger.warning("snapshot failed: %s", exc)
-                                    debug(f"snapshot failed: {exc}")
-                        if time.time() - started_at > soft_timeout:
-                            debug("soft timeout reached; killing salon session")
+                    else:
+                        host_missing_since = None
+                    now = time.time()
+                    if now - last_snapshot_time >= 60:
+                        last_snapshot_time = now
+                        host_turn_count += 1
+                        host_pane_target = self._read_host_pane_target()
+                        if host_pane_target:
+                            try:
+                                snap = subprocess.run(
+                                    ["tmux", "capture-pane", "-t", host_pane_target, "-p"],
+                                    capture_output=True,
+                                    text=True,
+                                    check=False,
+                                ).stdout[-2000:]
+                                elapsed = int(now - started_at)
+                                logger.info("[t=%ss turn=%s] host pane snapshot:\n%s", elapsed, host_turn_count, snap)
+                                debug(f"[t={elapsed}s turn={host_turn_count}] host pane snapshot:\n{snap}")
+                            except Exception as exc:
+                                logger.warning("snapshot failed: %s", exc)
+                                debug(f"snapshot failed: {exc}")
+                    if time.time() - started_at > soft_timeout:
+                        debug("soft timeout reached; killing salon session")
                         self._kill_salon_session()
                         usage = self._try_parse_session_logs(logging_dir)
                         debug(f"timeout_recovered_usage={usage}")
