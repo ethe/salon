@@ -245,7 +245,12 @@ export class TmuxBackend implements GuestRuntime {
 		const panes = this.listAliveRequired();
 		let newPaneId: string;
 		if (panes.length <= 1) {
-			const args = ["split-window", "-h", "-t", `${this.tmuxSession}:0.0`, "-l", "50%", "-c", workDir, "-P", "-F", "#{pane_id}"];
+			const totalWidth = this.tmuxControlQuery(["display-message", "-t", `${this.tmuxSession}:0.0`, "-p", "#{window_width}"]);
+			const width = Number(totalWidth);
+			if (!Number.isFinite(width) || width <= 0) {
+				throw new Error(`Invalid tmux window width '${totalWidth}' for session '${this.tmuxSession}'.`);
+			}
+			const args = ["split-window", "-h", "-t", `${this.tmuxSession}:0.0`, "-l", String(Math.floor(width / 2)), "-c", workDir, "-P", "-F", "#{pane_id}"];
 			if (command) args.push(command);
 			newPaneId = this.tmuxCommand(args);
 		} else {

@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import type { SalonLauncher } from "./runtime.js";
 import { TmuxLauncher } from "./tmux-backend.js";
@@ -11,6 +11,7 @@ const SALON_INSTANCE = process.env.SALON_INSTANCE || generateSalonInstance(WORK_
 const SALON_DIR = process.env.SALON_DIR || join(process.env.HOME!, ".salon", SALON_INSTANCE);
 const HOST_SESSION_DIR = join(SALON_DIR, "host-sessions");
 const TMUX_SESSION = process.env.SALON_TMUX_SESSION || `salon-${SALON_INSTANCE}`;
+const AUTONOMOUS_MODE = process.env.SALON_AUTONOMOUS === "1";
 
 function shellQuote(value: string): string {
 	return `'${value.replace(/'/g, `'\\''`)}'`;
@@ -53,6 +54,18 @@ function buildEnvironment(): Record<string, string> {
 	vars.SALON_TMUX_SESSION = TMUX_SESSION;
 	vars.SALON_WORK_DIR = WORK_DIR;
 	vars.SALON_NODE_BIN = dirname(process.execPath);
+	if (AUTONOMOUS_MODE) {
+		vars.SALON_AUTONOMOUS = "1";
+	}
+	if (process.env.SALON_TASK_FILE) {
+		vars.SALON_TASK_FILE = process.env.SALON_TASK_FILE;
+	}
+	if (process.env.SALON_RESULT_FILE) {
+		vars.SALON_RESULT_FILE = process.env.SALON_RESULT_FILE;
+	}
+	if (process.env.SALON_CONTAINER_ID) {
+		vars.SALON_CONTAINER_ID = process.env.SALON_CONTAINER_ID;
+	}
 
 	return vars;
 }
@@ -84,15 +97,23 @@ if (existing.length > 0) {
 
 launcher.createSession(WORK_DIR);
 launcher.setEnvironment(buildEnvironment());
+if (process.env.SALON_RESULT_FILE) {
+	writeFileSync(
+		join(dirname(process.env.SALON_RESULT_FILE), "host_pane.txt"),
+		`${TMUX_SESSION}:0.0\n`,
+	);
+}
 
 const extensionPath = join(SCRIPT_DIR, "src", "extension.ts");
 const piBin = join(SCRIPT_DIR, "node_modules", ".bin", "pi");
 const hostCommand = joinShellArgs([piBin, "--extension", extensionPath]);
 launcher.launchHost(hostCommand);
 
-// Attach
-try {
-	launcher.attach();
-} catch {
-	// session exited
+if (!AUTONOMOUS_MODE) {
+	// Attach
+	try {
+		launcher.attach();
+	} catch {
+		// session exited
+	}
 }

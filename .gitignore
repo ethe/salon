@@ -8,3 +8,6 @@ dist/
 coverage/
 *.tsbuildinfo
 *.tgz
+__pycache__/
+*.pyc
+salon_tbench/__pycache__/

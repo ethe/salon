@@ -317,7 +317,7 @@ console.log("\n== 8. tmux pane management ==");
 	tmux(`kill-session -t "${TMUX_SESSION}"`);
 	tmux(`new-session -d -s "${TMUX_SESSION}" -x 100 -y 30`);
 
-	const pane1 = tmux(`split-window -h -t "${TMUX_SESSION}:0.0" -l 50% -P -F "#{pane_id}"`);
+	const pane1 = tmux(`split-window -h -t "${TMUX_SESSION}:0.0" -l 50 -P -F "#{pane_id}"`);
 	assert("First guest pane created", pane1.startsWith("%"));
 
 	const panes1 = tmux(`list-panes -t "${TMUX_SESSION}:0" -F "#{pane_id}"`).split("\n");

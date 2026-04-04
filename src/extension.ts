@@ -36,6 +36,10 @@ import {
 
 const SALON_INSTANCE = process.env.SALON_INSTANCE || `default-${randomUUID().slice(0, 8)}`;
 const TMUX_SESSION = process.env.SALON_TMUX_SESSION || `salon-${SALON_INSTANCE}`;
+const SALON_AUTONOMOUS = process.env.SALON_AUTONOMOUS === "1";
+const SALON_TASK_FILE = process.env.SALON_TASK_FILE;
+const SALON_RESULT_FILE = process.env.SALON_RESULT_FILE;
+const SALON_CONTAINER_ID = process.env.SALON_CONTAINER_ID;
 const SALON_STATE_ENTRY_TYPE = "salon_state";
 const SALON_STATE_VERSION = 1;
 const SALON_STATUS_MESSAGE_TYPE = "salon-status";
@@ -622,7 +626,10 @@ function createCodexGuestNonce(): string {
 }
 
 function buildGuestInstructions(name: string, nonce?: string): string {
-	const base = `Your name in this salon is ${name}.\n\n${GUEST_INSTRUCTIONS}`;
+	const autonomousConstraint = SALON_CONTAINER_ID
+		? `\n\nYou are working on a task inside Docker container $SALON_CONTAINER_ID.\nALL commands must be run via: docker exec $SALON_CONTAINER_ID bash -c '<command>'\nDo NOT use your native Read, Edit, Grep, or Bash tools on the host filesystem.`
+		: "";
+	const base = `Your name in this salon is ${name}.\n\n${GUEST_INSTRUCTIONS}${autonomousConstraint}`;
 	return nonce ? `${base}\n\n${nonce}` : base;
 }
 
@@ -1998,6 +2005,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 			})),
 		}),
 		async execute(_id, params: any) {
+			const dangerouslySkipPermissions = SALON_AUTONOMOUS ? true : params.dangerously_skip_permissions === true;
 			const guest = activateGuestLifecycle(inviteGuest(
 				undefined,
 				params.type,
@@ -2005,7 +2013,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 				salonDir,
 				guestDir,
 				runtime,
-				{ dangerouslySkipPermissions: params.dangerously_skip_permissions === true },
+				{ dangerouslySkipPermissions },
 			));
 			scanCodexSessionId(guest);
 			const initialMessageStatus = params.initial_message !== undefined
@@ -2064,7 +2072,15 @@ export default function salonExtension(pi: ExtensionAPI) {
 			const discId = `disc_${Date.now()}`;
 
 			const inviteDiscussionGuest = (type: GuestType): Guest => {
-				const guest = activateGuestLifecycle(inviteGuest(undefined, type, workDir, salonDir, guestDir, runtime));
+				const guest = activateGuestLifecycle(inviteGuest(
+					undefined,
+					type,
+					workDir,
+					salonDir,
+					guestDir,
+					runtime,
+					{ dangerouslySkipPermissions: SALON_AUTONOMOUS },
+				));
 				scanCodexSessionId(guest);
 				return guest;
 			};
@@ -2387,6 +2403,72 @@ export default function salonExtension(pi: ExtensionAPI) {
 		},
 	});
 
+	if (SALON_AUTONOMOUS) {
+		pi.registerTool({
+			name: "finish_task",
+			label: "Finish Task",
+			description: "Signal that the autonomous task is complete or cannot proceed further.",
+			promptSnippet: "Finish the autonomous task and write the result file",
+			parameters: Type.Object({
+				status: Type.Union([
+					Type.Literal("solved"),
+					Type.Literal("incomplete"),
+					Type.Literal("blocked"),
+				], { description: "Final autonomous task status" }),
+				summary: Type.String({ description: "Short summary of what was achieved" }),
+				verification_summary: Type.Optional(Type.String({
+					description: "Optional summary of verification performed or remaining gaps",
+				})),
+			}),
+			async execute(_id, params: any) {
+				if (!SALON_RESULT_FILE) {
+					return {
+						content: [{ type: "text" as const, text: "SALON_RESULT_FILE is not configured." }],
+						details: {},
+					};
+				}
+
+				const trackedGuests = new Map<string, GuestRecord>();
+				for (const guest of guests.values()) {
+					trackedGuests.set(guest.name, guest);
+				}
+				for (const guest of dismissedGuests.values()) {
+					if (!trackedGuests.has(guest.name)) {
+						trackedGuests.set(guest.name, guest);
+					}
+				}
+				for (const guest of trackedGuests.values()) {
+					refreshGuestQuantState(guest);
+				}
+
+				const guestUsage = Object.fromEntries(
+					Array.from(guestQuantStates.entries()).map(([name, state]) => [
+						name,
+						{
+							input_tokens: state.totalInputTokens,
+							output_tokens: state.totalOutputTokens,
+						},
+					]),
+				);
+
+				mkdirSync(dirname(SALON_RESULT_FILE), { recursive: true });
+				writeFileSync(
+					SALON_RESULT_FILE,
+					JSON.stringify({
+						status: params.status,
+						summary: params.summary,
+						verification_summary: params.verification_summary,
+						finished_at: new Date().toISOString(),
+						guests: guestUsage,
+					}, null, 2),
+				);
+
+				await teardownSalonSession({ killTmuxSession: true });
+				process.exit(0);
+			},
+		});
+	}
+
 	// ── Host system prompt ────────────────────────────────────────────
 	pi.on("before_agent_start", (event) => {
 		const hostPreamble =
@@ -2599,6 +2681,20 @@ Discussion status updates arrive as: [salon] content
 When these appear, process them thoughtfully — don't just echo them to the user. Add your perspective, context, or next steps.
 
 `;
+		const autonomousPreamble = SALON_AUTONOMOUS
+			? `
+# Autonomous mode
+
+You are in AUTONOMOUS mode. No human is in the loop.
+- Do not call ask_user
+- Invite available guests (claude and/or codex) to collaborate
+- In autonomous mode, invite_guest always uses dangerously_skip_permissions=true
+- All guest commands must use: docker exec $SALON_CONTAINER_ID bash -c '<command>'
+- Guests must NOT use Read, Edit, Grep, or Bash tools on the host filesystem
+- When task is complete or no further high-value action is possible, call finish_task
+
+`
+			: "";
 		// Replace pi's default identity line with salon context
 		const basePrompt = event.systemPrompt.replace(
 			/^You are an expert coding assistant operating inside pi, a coding agent harness\. You help users by reading files, executing commands, editing code, and writing new files\.\n*/,
@@ -2608,7 +2704,7 @@ When these appear, process them thoughtfully — don't just echo them to the use
 			? `\n# Recovered salon state after resume\n${pendingResumeSummary}\n`
 			: "";
 		pendingResumeSummary = undefined;
-		return { systemPrompt: hostPreamble + resumeSummary + basePrompt };
+		return { systemPrompt: hostPreamble + autonomousPreamble + resumeSummary + basePrompt };
 	});
 
 	pi.on("context", (event) => {
@@ -2794,6 +2890,10 @@ When these appear, process them thoughtfully — don't just echo them to the use
 	pi.on("session_start", async (_event, ctx) => {
 		restoreSalonSession(ctx);
 		await openSalonMessageServer();
+		if (SALON_AUTONOMOUS && SALON_TASK_FILE && existsSync(SALON_TASK_FILE)) {
+			const task = readFileSync(SALON_TASK_FILE, "utf8");
+			await pi.sendUserMessage(task, { deliverAs: "followUp" });
+		}
 	});
 
 	pi.on("session_switch", async (_event, ctx) => {

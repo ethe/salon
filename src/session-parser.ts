@@ -5,6 +5,8 @@ import { join } from "node:path";
 export interface GuestQuantState {
 	lastTurnPromptTokens?: number;
 	lastTurnOutputTokens?: number;
+	totalInputTokens: number;
+	totalOutputTokens: number;
 	contextWindowSize?: number;
 	contextUtilization?: number;
 	compactionCount: number;
@@ -68,6 +70,8 @@ const CLAUDE_CONTEXT_WINDOWS: Array<[string, number]> = [
 export function createGuestQuantState(): GuestQuantState {
 	return {
 		compactionCount: 0,
+		totalInputTokens: 0,
+		totalOutputTokens: 0,
 		turnCount: 0,
 		sessionLogOffset: 0,
 	};
@@ -179,6 +183,8 @@ export function parseClaudeSessionLines(lines: string[], state: GuestQuantState)
 				(usage.cache_read_input_tokens ?? 0) +
 				(usage.cache_creation_input_tokens ?? 0);
 			nextState.lastTurnOutputTokens = usage.output_tokens;
+			nextState.totalInputTokens += nextState.lastTurnPromptTokens;
+			nextState.totalOutputTokens += nextState.lastTurnOutputTokens ?? 0;
 			nextState.turnCount += 1;
 			const contextWindowSize = lookupClaudeContextWindow(entry.message.model);
 			if (contextWindowSize !== undefined) {
@@ -211,9 +217,11 @@ export function parseCodexSessionLines(lines: string[], state: GuestQuantState):
 				const inputTokens = usage?.input_tokens;
 				if (typeof inputTokens === "number") {
 					nextState.lastTurnPromptTokens = inputTokens;
+					nextState.totalInputTokens += inputTokens;
 				}
 				if (typeof usage?.output_tokens === "number") {
 					nextState.lastTurnOutputTokens = usage.output_tokens;
+					nextState.totalOutputTokens += usage.output_tokens;
 				}
 				if (typeof entry.payload.info.model_context_window === "number") {
 					nextState.contextWindowSize = entry.payload.info.model_context_window;
