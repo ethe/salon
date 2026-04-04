@@ -4,6 +4,7 @@ import os
 import subprocess
 import tempfile
 import time
+import traceback
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -21,13 +22,14 @@ class SalonAgent(BaseAgent):
         soft_timeout_sec: int = 1200,
         completion_reserve_sec: int = 180,
         **kwargs: Any,
-    ) -> None:
-        self._tmux_session_name: str | None = None
-        self._salon_dir: Path | None = None
-        self._host_pane_file: Path | None = None
-        self._soft_timeout_sec = soft_timeout_sec
-        self._completion_reserve_sec = completion_reserve_sec
-        self._extra_kwargs = kwargs
+	    ) -> None:
+	        self._tmux_session_name: str | None = None
+	        self._salon_dir: Path | None = None
+	        self._host_pane_file: Path | None = None
+	        self._result_file: Path | None = None
+	        self._soft_timeout_sec = soft_timeout_sec
+	        self._completion_reserve_sec = completion_reserve_sec
+	        self._extra_kwargs = kwargs
 
     @staticmethod
     def name() -> str:
@@ -39,69 +41,118 @@ class SalonAgent(BaseAgent):
         session: TmuxSession,
         logging_dir: Path | None = None,
     ) -> AgentResult:
-        with tempfile.TemporaryDirectory(prefix="salon-tbench-") as tmpdir:
-            tmpdir_path = Path(tmpdir)
-            task_file = tmpdir_path / "task.md"
-            result_file = tmpdir_path / "result.json"
-            salon_dir = tmpdir_path / "salon-runtime"
-            run_id = uuid.uuid4().hex[:8]
-            salon_instance = f"tbench-{run_id}"
-            tmux_session_name = f"salon-{salon_instance}"
+        debug_path = logging_dir / "adapter_debug.log" if logging_dir else None
 
-            self._tmux_session_name = tmux_session_name
-            self._salon_dir = salon_dir
-            self._host_pane_file = result_file.parent / "host_pane.txt"
+        def debug(message: str) -> None:
+            if debug_path is None:
+                return
+            debug_path.parent.mkdir(parents=True, exist_ok=True)
+            with debug_path.open("a", encoding="utf-8") as handle:
+                handle.write(f"{message}\n")
 
-            task_file.write_text(instruction, encoding="utf-8")
-            container_id = session.container.id
+        try:
+            debug(f"perform_task start logging_dir={logging_dir}")
+            debug(f"session has container={hasattr(session, 'container')}")
+            with tempfile.TemporaryDirectory(prefix="salon-tbench-") as tmpdir:
+                tmpdir_path = Path(tmpdir)
+                task_file = tmpdir_path / "task.md"
+                result_file = tmpdir_path / "result.json"
+                salon_dir = tmpdir_path / "salon-runtime"
+                run_id = uuid.uuid4().hex[:8]
+                salon_instance = f"tbench-{run_id}"
+                tmux_session_name = f"salon-{salon_instance}"
 
-            env = {
-                **os.environ,
-                "SALON_AUTONOMOUS": "1",
-                "SALON_TASK_FILE": str(task_file),
-                "SALON_RESULT_FILE": str(result_file),
-                "SALON_CONTAINER_ID": str(container_id),
-                "SALON_DIR": str(salon_dir),
-                "SALON_INSTANCE": salon_instance,
-                "SALON_TMUX_SESSION": tmux_session_name,
-            }
+                self._tmux_session_name = tmux_session_name
+                self._salon_dir = salon_dir
+                self._host_pane_file = result_file.parent / "host_pane.txt"
+                self._result_file = result_file
 
-            repo_root = Path(__file__).resolve().parents[1]
-            launcher = subprocess.Popen(
-                ["node", "dist/main.js"],
-                cwd=repo_root,
-                env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            try:
-                launcher.wait(timeout=120)
-            except subprocess.TimeoutExpired:
-                launcher.kill()
-                launcher.wait(timeout=5)
-                return AgentResult(failure_mode=FailureMode.UNKNOWN_AGENT_ERROR)
+                task_file.write_text(instruction, encoding="utf-8")
+                container_id = session.container.id
+                debug(f"container_id={container_id}")
+                debug(f"tmpdir={tmpdir_path}")
+                debug(f"tmux_session_name={tmux_session_name}")
 
-            soft_timeout = int(os.environ.get("SALON_SOFT_TIMEOUT", str(self._soft_timeout_sec)))
-            started_at = time.time()
-            while True:
-                if result_file.exists():
-                    return self._parse_result(result_file)
-                if not self._host_pane_alive():
-                    usage = self._try_parse_session_logs(logging_dir)
-                    return AgentResult(
-                        total_input_tokens=usage["total_input_tokens"],
-                        total_output_tokens=usage["total_output_tokens"],
-                        failure_mode=FailureMode.UNKNOWN_AGENT_ERROR,
-                    )
-                if time.time() - started_at > soft_timeout:
-                    self._kill_salon_session()
-                    usage = self._try_parse_session_logs(logging_dir)
-                    return AgentResult(
-                        total_input_tokens=usage["total_input_tokens"],
-                        total_output_tokens=usage["total_output_tokens"],
-                        failure_mode=FailureMode.AGENT_TIMEOUT,
-                    )
-                time.sleep(1)
+                env = {
+                    **os.environ,
+                    "SALON_AUTONOMOUS": "1",
+                    "SALON_TASK_FILE": str(task_file),
+                    "SALON_RESULT_FILE": str(result_file),
+                    "SALON_CONTAINER_ID": str(container_id),
+                    "SALON_DIR": str(salon_dir),
+                    "SALON_INSTANCE": salon_instance,
+                    "SALON_TMUX_SESSION": tmux_session_name,
+                }
+
+                repo_root = Path(__file__).resolve().parents[1]
+                debug(f"repo_root={repo_root}")
+                launcher = subprocess.Popen(
+                    ["node", "dist/main.js"],
+                    cwd=repo_root,
+                    env=env,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                debug(f"launcher_pid={launcher.pid}")
+                try:
+                    launcher.wait(timeout=120)
+                    debug(f"launcher_returncode={launcher.returncode}")
+                except subprocess.TimeoutExpired:
+                    launcher.kill()
+                    launcher.wait(timeout=5)
+                    debug("launcher timeout waiting for exit")
+                    return AgentResult(failure_mode=FailureMode.UNKNOWN_AGENT_ERROR)
+
+                soft_timeout = int(os.environ.get("SALON_SOFT_TIMEOUT", str(self._soft_timeout_sec)))
+                started_at = time.time()
+                host_missing_since: float | None = None
+                while True:
+                    if result_file.exists():
+                        debug(f"result_file exists={result_file}")
+                        try:
+                            debug(f"result_file contents={result_file.read_text(encoding='utf-8')}")
+                        except Exception as exc:
+                            debug(f"failed to read result_file: {exc}")
+                        return self._parse_result(result_file)
+                    if not self._host_pane_alive():
+                        now = time.time()
+                        if host_missing_since is None:
+                            host_missing_since = now
+                            logger.warning("host pane not detected, starting 30s grace period")
+                            debug(f"host pane missing target={self._read_host_pane_target()}")
+                            debug(f"host_pane_file_exists={self._host_pane_file.exists() if self._host_pane_file else False}")
+                        elif now - host_missing_since > 30 and not self._salon_session_alive():
+                            session_check = subprocess.run(
+                                ["tmux", "list-sessions", "-F", "#{session_name}"],
+                                capture_output=True,
+                                text=True,
+                                check=False,
+                            )
+                            debug(f"tmux_sessions={session_check.stdout.strip()}")
+                            usage = self._try_parse_session_logs(logging_dir)
+                            debug(f"recovered_usage={usage}")
+                            return AgentResult(
+                                total_input_tokens=usage["total_input_tokens"],
+                                total_output_tokens=usage["total_output_tokens"],
+                                failure_mode=FailureMode.UNKNOWN_AGENT_ERROR,
+                            )
+                    else:
+                        host_missing_since = None
+                    if time.time() - started_at > soft_timeout:
+                        debug("soft timeout reached; killing salon session")
+                        self._kill_salon_session()
+                        usage = self._try_parse_session_logs(logging_dir)
+                        debug(f"timeout_recovered_usage={usage}")
+                        return AgentResult(
+                            total_input_tokens=usage["total_input_tokens"],
+                            total_output_tokens=usage["total_output_tokens"],
+                            failure_mode=FailureMode.AGENT_TIMEOUT,
+                        )
+                    time.sleep(1)
+        except Exception:
+            if logging_dir:
+                (logging_dir / "adapter_error.log").write_text(traceback.format_exc(), encoding="utf-8")
+            raise
 
     def _parse_result(self, result_file: Path) -> AgentResult:
         data = json.loads(result_file.read_text(encoding="utf-8"))
@@ -119,15 +170,14 @@ class SalonAgent(BaseAgent):
         if not host_pane_target:
             return False
         result = subprocess.run(
-            ["tmux", "list-panes", "-t", host_pane_target, "-F", "#{pane_dead}"],
+            ["tmux", "display-message", "-p", "-t", host_pane_target, "#{pane_dead}"],
             capture_output=True,
             text=True,
             check=False,
         )
         if result.returncode != 0:
             return False
-        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-        return len(lines) == 1 and lines[0] == "0"
+        return result.stdout.strip() == "0"
 
     def _read_host_pane_target(self) -> str | None:
         if self._host_pane_file and self._host_pane_file.exists():
@@ -137,6 +187,17 @@ class SalonAgent(BaseAgent):
         if self._tmux_session_name:
             return f"{self._tmux_session_name}:0.0"
         return None
+
+    def _salon_session_alive(self) -> bool:
+        if not self._tmux_session_name:
+            return False
+        result = subprocess.run(
+            ["tmux", "has-session", "-t", self._tmux_session_name],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return result.returncode == 0
 
     def _try_parse_session_logs(self, logging_dir: Path | None) -> dict[str, int]:
         _ = logging_dir
