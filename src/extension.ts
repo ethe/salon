@@ -627,7 +627,7 @@ function createCodexGuestNonce(): string {
 
 function buildGuestInstructions(name: string, nonce?: string): string {
 	const autonomousConstraint = SALON_CONTAINER_ID
-		? `\n\nYou are working on a task inside Docker container $SALON_CONTAINER_ID.\nALL commands must be run via: docker exec $SALON_CONTAINER_ID bash -c '<command>'\nDo NOT use your native Read, Edit, Grep, or Bash tools on the host filesystem.`
+		? `\n\nYou are working on a task inside Docker container ${SALON_CONTAINER_ID}.\nALL commands must be run via: docker exec ${SALON_CONTAINER_ID} bash -c '<command>'\nFor multi-line file writes: docker exec ${SALON_CONTAINER_ID} bash -c 'cat > /path << "EOF"\ncontent\nEOF'\nDo NOT use your native Read, Edit, Grep, or Bash tools on the host filesystem — they operate locally, not inside the container.`
 		: "";
 	const base = `Your name in this salon is ${name}.\n\n${GUEST_INSTRUCTIONS}${autonomousConstraint}`;
 	return nonce ? `${base}\n\n${nonce}` : base;
@@ -2685,13 +2685,54 @@ When these appear, process them thoughtfully — don't just echo them to the use
 			? `
 # Autonomous mode
 
-You are in AUTONOMOUS mode. No human is in the loop.
-- Do not call ask_user
-- Invite available guests (claude and/or codex) to collaborate
-- In autonomous mode, invite_guest always uses dangerously_skip_permissions=true
-- All guest commands must use: docker exec $SALON_CONTAINER_ID bash -c '<command>'
-- Guests must NOT use Read, Edit, Grep, or Bash tools on the host filesystem
-- When task is complete or no further high-value action is possible, call finish_task
+You are in AUTONOMOUS mode. No human is in the loop. A Python adapter monitors your progress and will kill this session on timeout.
+
+## Overrides to normal behavior
+- NEVER call ask_user. If you would normally escalate to the user, make your best judgment and proceed. If truly blocked, call finish_task with status "blocked".
+- invite_guest automatically forces dangerously_skip_permissions=true.
+- Skip all user-facing narration. Do not explain state transitions, do not summarize guest output for "the user." Minimize your own text output — focus on tool calls and guest coordination.
+
+## Container access
+All work happens inside Docker container ${SALON_CONTAINER_ID}.
+
+Guest commands MUST use this exact form:
+  docker exec ${SALON_CONTAINER_ID} bash -c '<command>'
+
+For multi-line writes, use a quoted heredoc delimiter to prevent premature expansion:
+  docker exec ${SALON_CONTAINER_ID} bash -c 'cat > /path/to/file << "EOF"
+  file content here
+  EOF'
+
+For commands containing single quotes, use double-quote wrapping:
+  docker exec ${SALON_CONTAINER_ID} bash -c "python3 -c 'print(1)'"
+
+Guests must NOT use their native Read, Edit, Grep, or Bash tools on the host filesystem — those operate on the host, not inside the container. All file inspection must go through docker exec (cat, grep, find, etc.).
+
+If docker exec fails with "No such container" or "is not running", call finish_task(status="blocked") immediately — the environment is broken.
+
+## Workflow
+1. Invite 1-2 available guests. Brief each with the full task description, container ID (${SALON_CONTAINER_ID}), and the docker exec constraint.
+2. For tasks requiring design: use discuss, then assign executor + reviewer.
+3. For straightforward tasks: assign one guest as executor, other as reviewer.
+4. After execution: have the reviewer verify inside the container (run tests, check output files, inspect results).
+5. Call finish_task based on verification outcome.
+
+## Termination — call finish_task promptly
+
+finish_task(status="solved"):
+  Verification commands pass, or strong evidence the task requirements are met.
+
+finish_task(status="incomplete"):
+  Partial progress was made. Use after: 2 fix-review cycles failed on the same issue, or the approach works partially but a specific sub-problem remains unsolved.
+
+finish_task(status="blocked"):
+  No viable path forward. Use when: docker exec fails, no guest can make progress, the same error class repeats 3+ times, or you have exhausted meaningfully distinct approaches.
+
+## Hard limits
+- Do not run more than 2 fix-review cycles on the same issue. After 2 rounds, call finish_task with the current state.
+- Do not invite more than 2 guests total.
+- If a guest produces the same category of error 3 consecutive times, switch to the other guest or call finish_task.
+- Aim to reach finish_task within roughly 8 host turns. Beyond 10 turns, you are likely looping — call finish_task.
 
 `
 			: "";
