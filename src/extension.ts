@@ -622,7 +622,8 @@ If your role is unclear, ask the host to clarify before proceeding.`;
 
 const AUTONOMOUS_TB_GUEST_BRIEF = `You are working on a task inside a Docker container.
 Use the \`tb\` tool to interact with the container:
-  tb exec -- 'bash command'      # run a command in the container
+  tb exec -- 'bash command'      # single-string form; runs via bash -c
+  tb exec -- bash -lc 'cmd'      # argv form; explicit shell invocation
   tb exec --timeout 60 -- 'cmd'  # with custom timeout (default: 120s)
   tb read /app/file.py           # read a file from the container
   tb write /app/file.py          # write a file (pipe content via stdin)
@@ -2726,6 +2727,7 @@ All work happens inside the task container, accessed via the tb bridge.
 
 Guests must use the tb tool exactly as documented in their brief:
   tb exec -- 'bash command'
+  tb exec -- bash -lc 'cmd'
   tb exec --timeout 60 -- 'cmd'
   tb read /app/file.py
   tb write /app/file.py
@@ -2739,6 +2741,8 @@ If tb fails because the bridge/socket is unavailable or container access is brok
 ## Capability preflight (run before assigning roles)
 Each guest must verify container access AND write capability:
   tb exec -- 'echo access_ok && echo ok > /tmp/__probe && rm /tmp/__probe'
+Equivalent argv form if preferred:
+  tb exec -- bash -lc 'echo access_ok && echo ok > /tmp/__probe && rm /tmp/__probe'
 
 If a guest fails this check, do NOT assign them container write tasks.
 Reassign them to analysis/planning/review only.

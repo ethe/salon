@@ -34,6 +34,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 			command_parts = command_parts[1:]
 		if not command_parts:
 			parser.error("tb exec requires a command after '--'")
+		if len(command_parts) == 1:
+			command_parts = ["bash", "-c", command_parts[0]]
 		args.command_text = shlex.join(command_parts)
 	return args
 
