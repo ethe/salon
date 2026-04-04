@@ -52,6 +52,7 @@ interface GuestRuntimeFile {
 	nonce?: string;
 	startedAt?: string;
 	workspaceDir?: string;
+	dangerouslySkipPermissions?: boolean;
 }
 
 interface GuestRecord {
@@ -62,6 +63,7 @@ interface GuestRecord {
 	startedAt?: number;
 	lifecycleStatus: GuestLifecycleStatus;
 	workspaceDir: string;
+	dangerouslySkipPermissions?: boolean;
 	teardownReason?: GuestTeardownReason;
 }
 
@@ -99,6 +101,7 @@ interface PersistedGuestInfo {
 	nonce?: string;
 	startedAt?: string;
 	workspaceDir?: string;
+	dangerouslySkipPermissions?: boolean;
 }
 
 interface SalonStateSnapshot {
@@ -930,11 +933,13 @@ function inviteGuest(
 	salonDir: string,
 	guestDir: string,
 	runtime: GuestRuntime,
+	options: { dangerouslySkipPermissions?: boolean } = {},
 ): Guest {
 	name = ensureGuestNameAvailable(name ? name : generateGuestName());
 
 	const sessionId = type === "claude" ? randomUUID() : undefined;
 	const nonce = type === "codex" ? createCodexGuestNonce() : undefined;
+	const dangerouslySkipPermissions = options.dangerouslySkipPermissions === true;
 
 	const instructions = buildGuestInstructions(name, nonce);
 	const instructionsFile = join(guestDir, `${name}.instructions`);
@@ -942,12 +947,18 @@ function inviteGuest(
 
 	let cmd: string;
 	if (type === "codex") {
-		cmd = joinShellArgs(["codex", "-c", `model_instructions_file=${instructionsFile}`]);
+		cmd = joinShellArgs([
+			"codex",
+			...(dangerouslySkipPermissions ? ["--dangerously-bypass-approvals-and-sandbox"] : []),
+			"-c",
+			`model_instructions_file=${instructionsFile}`,
+		]);
 	} else {
 		cmd = joinShellArgs([
 			"claude",
 			"--session-id",
 			sessionId!,
+			...(dangerouslySkipPermissions ? ["--dangerously-skip-permissions"] : []),
 			"--append-system-prompt-file",
 			instructionsFile,
 		]);
@@ -971,6 +982,7 @@ function inviteGuest(
 		startedAt: Date.now(),
 		lifecycleStatus: "active",
 		workspaceDir: workDir,
+		dangerouslySkipPermissions,
 		ready: false,
 	};
 	return guest;
@@ -1010,6 +1022,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 			nonce: guest.nonce,
 			startedAt: serializeStartedAt(guest.startedAt),
 			workspaceDir: guest.workspaceDir,
+			dangerouslySkipPermissions: guest.dangerouslySkipPermissions,
 		};
 		writeFileSync(join(guestDir, `${guest.name}.json`), JSON.stringify(runtimeFile, null, 2));
 	}
@@ -1032,6 +1045,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 				nonce: typeof parsed.nonce === "string" ? parsed.nonce : undefined,
 				startedAt: typeof parsed.startedAt === "string" ? parsed.startedAt : undefined,
 				workspaceDir: typeof parsed.workspaceDir === "string" ? parsed.workspaceDir : undefined,
+				dangerouslySkipPermissions: typeof parsed.dangerouslySkipPermissions === "boolean" ? parsed.dangerouslySkipPermissions : undefined,
 			};
 		} catch {
 			return undefined;
@@ -1047,6 +1061,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 			nonce: guest.nonce,
 			startedAt: serializeStartedAt(guest.startedAt),
 			workspaceDir: guest.workspaceDir,
+			dangerouslySkipPermissions: guest.dangerouslySkipPermissions,
 		};
 	}
 
@@ -1585,6 +1600,9 @@ export default function salonExtension(pi: ExtensionAPI) {
 				// All guests become suspended on restore; resume via resume_guest / autoResume.
 				lifecycleStatus: persistedGuest.status === "dismissed" ? "dismissed" : "suspended",
 				workspaceDir: runtimeGuest?.workspaceDir || persistedGuest.workspaceDir || workDir,
+				dangerouslySkipPermissions:
+					runtimeGuest?.dangerouslySkipPermissions ??
+					persistedGuest.dangerouslySkipPermissions,
 			};
 
 			trackGuestNameUsage(record.name);
@@ -1636,6 +1654,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 			startedAt: guest.startedAt,
 			lifecycleStatus: resolveInactiveGuestStatus(guest),
 			workspaceDir: guest.workspaceDir,
+			dangerouslySkipPermissions: guest.dangerouslySkipPermissions,
 		};
 	}
 
@@ -1753,14 +1772,16 @@ export default function salonExtension(pi: ExtensionAPI) {
 			const status = getGuestDisplayStatus(guest);
 			const discId = guestToDiscussion.get(guest.name);
 			const disc = discId ? discussions.get(discId) : undefined;
+			const bypassLabel = guest.dangerouslySkipPermissions ? " [bypass]" : "";
 			const discLabel = disc ? ` [discussing: ${disc.stage}]` : "";
 			const quantLabel = formatGuestQuantSummary(refreshGuestQuantState(guest));
-			lines.push(`  ${guest.name} (${guest.type}): ${status}${discLabel}${quantLabel}`);
+			lines.push(`  ${guest.name} (${guest.type})${bypassLabel}: ${status}${discLabel}${quantLabel}`);
 			lines.push(...getGuestContextStatusLines(guest.name));
 		}
 		for (const guest of dismissedGuests.values()) {
 			if (guest.lifecycleStatus !== "suspended") continue;
-			lines.push(`  ${guest.name} (${guest.type}): ${guest.lifecycleStatus}${guest.sessionId ? " (session saved)" : ""}`);
+			const bypassLabel = guest.dangerouslySkipPermissions ? " [bypass]" : "";
+			lines.push(`  ${guest.name} (${guest.type})${bypassLabel}: ${guest.lifecycleStatus}${guest.sessionId ? " (session saved)" : ""}`);
 		}
 		if (lines.length === 0) return undefined;
 		return `[salon-status]\n${lines.join("\n")}\n[/salon-status]`;
@@ -1870,15 +1891,24 @@ export default function salonExtension(pi: ExtensionAPI) {
 		if (!existsSync(instructionsFile)) {
 			writeFileSync(instructionsFile, buildGuestInstructions(name, dismissed.nonce));
 		}
+		const dangerouslySkipPermissions = dismissed.dangerouslySkipPermissions === true;
 
 		let cmd: string;
 		if (dismissed.type === "codex") {
-			cmd = joinShellArgs(["codex", "resume", dismissed.sessionId!, "-c", `model_instructions_file=${instructionsFile}`]);
+			cmd = joinShellArgs([
+				"codex",
+				"resume",
+				dismissed.sessionId!,
+				...(dangerouslySkipPermissions ? ["--dangerously-bypass-approvals-and-sandbox"] : []),
+				"-c",
+				`model_instructions_file=${instructionsFile}`,
+			]);
 		} else {
 			cmd = joinShellArgs([
 				"claude",
 				"--resume",
 				dismissed.sessionId!,
+				...(dangerouslySkipPermissions ? ["--dangerously-skip-permissions"] : []),
 				"--append-system-prompt-file",
 				instructionsFile,
 			]);
@@ -1902,6 +1932,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 			startedAt: Date.now(),
 			lifecycleStatus: "active",
 			workspaceDir: resumeWorkDir,
+			dangerouslySkipPermissions,
 			ready: false,
 		};
 
@@ -1959,12 +1990,23 @@ export default function salonExtension(pi: ExtensionAPI) {
 		],
 		parameters: Type.Object({
 			type: Type.Union([Type.Literal("claude"), Type.Literal("codex")], { description: "Guest type" }),
+			dangerously_skip_permissions: Type.Optional(Type.Boolean({
+				description: "Launch the guest in bypass mode so Claude Code / Codex CLI skip permission prompts. Dangerous; use only when you explicitly want approvals and sandbox checks disabled.",
+			})),
 			initial_message: Type.Optional(Type.String({
 				description: "Optional first message to send immediately after inviting. If the guest is still starting up, it will be queued automatically.",
 			})),
 		}),
 		async execute(_id, params: any) {
-			const guest = activateGuestLifecycle(inviteGuest(undefined, params.type, workDir, salonDir, guestDir, runtime));
+			const guest = activateGuestLifecycle(inviteGuest(
+				undefined,
+				params.type,
+				workDir,
+				salonDir,
+				guestDir,
+				runtime,
+				{ dangerouslySkipPermissions: params.dangerously_skip_permissions === true },
+			));
 			scanCodexSessionId(guest);
 			const initialMessageStatus = params.initial_message !== undefined
 				? sayToGuest(guest, params.initial_message)
