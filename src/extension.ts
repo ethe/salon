@@ -626,6 +626,10 @@ Use the \`tb\` tool to interact with the container:
   tb exec --timeout 60 -- 'cmd'  # with custom timeout (default: 120s)
   tb read /app/file.py           # read a file from the container
   tb write /app/file.py          # write a file (pipe content via stdin)
+    example: cat << 'EOF' | tb write /app/file.py
+             line 1
+             line 2
+             EOF
   tb ls /app                     # list files
 
 Do NOT invoke Docker directly, use ssh, or use your native Read/Edit/Bash tools to access container files.
