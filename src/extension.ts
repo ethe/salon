@@ -2815,10 +2815,11 @@ Tell the reviewer in its brief:
 
 ### Step 3 — Streaming fix cycle (max 2 rounds per issue)
 
-When the reviewer reports a blocker, IMMEDIATELY forward it to the executor
-with say_to_guest. Do NOT wait for the reviewer to finish its full review.
-Then tell the reviewer to continue reviewing. This way the executor starts
-fixing while the reviewer keeps finding issues — review and fix run in parallel.
+When the reviewer reports a blocker, do TWO say_to_guest calls in the SAME response:
+  1. Forward the blocker to the executor: "Reviewer found: <issue>. Please fix."
+  2. Tell the reviewer to continue: "Forwarded to executor. Keep reviewing."
+The reviewer is a coding agent — it stops after each response and needs you to
+send a message to trigger its next turn. Always explicitly tell it to continue.
 
 Max 2 fix attempts per blocker. If the same issue persists after 2 rounds,
 call finish_task with whatever state exists.
