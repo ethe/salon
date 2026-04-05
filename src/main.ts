@@ -56,12 +56,8 @@ function buildEnvironment(): Record<string, string> {
 	vars.SALON_WORK_DIR = WORK_DIR;
 	if (AUTONOMOUS_MODE) {
 		vars.SALON_AUTONOMOUS = "1";
-		if (process.env.SALON_TB_BRIDGE_SOCK) {
-			vars.SALON_TB_BRIDGE_SOCK = process.env.SALON_TB_BRIDGE_SOCK;
-		}
-		if (process.env.SALON_TB_SHIM_DIR) {
-			vars.SALON_TB_SHIM_DIR = process.env.SALON_TB_SHIM_DIR;
-			pathPrefixes.unshift(process.env.SALON_TB_SHIM_DIR);
+		if (process.env.SALON_CONTAINER_ID) {
+			vars.SALON_CONTAINER_ID = process.env.SALON_CONTAINER_ID;
 		}
 	}
 	vars.SALON_NODE_BIN = pathPrefixes.join(":");
