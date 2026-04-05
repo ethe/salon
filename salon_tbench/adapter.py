@@ -21,6 +21,8 @@ class SalonAgent(BaseAgent):
         self,
         soft_timeout_sec: int = 1200,
         completion_reserve_sec: int = 60,
+        max_resume_rounds: int = 3,
+        resume_window_sec: int = 600,
         **kwargs: Any,
         ) -> None:
             self._tmux_session_name: str | None = None
@@ -29,6 +31,8 @@ class SalonAgent(BaseAgent):
             self._result_file: Path | None = None
             self._soft_timeout_sec = soft_timeout_sec
             self._completion_reserve_sec = completion_reserve_sec
+            self._max_resume_rounds = max_resume_rounds
+            self._resume_window_sec = resume_window_sec
             self._extra_kwargs = kwargs
 
     @staticmethod
@@ -139,13 +143,19 @@ class SalonAgent(BaseAgent):
 
                 configured_soft_timeout = int(os.environ.get("SALON_SOFT_TIMEOUT", str(self._soft_timeout_sec)))
                 soft_timeout = self._effective_soft_timeout()
+                resume_window = int(os.environ.get("SALON_RESUME_WINDOW", str(self._resume_window_sec)))
+                max_rounds = int(os.environ.get("SALON_MAX_RESUME_ROUNDS", str(self._max_resume_rounds)))
                 debug(f"configured_soft_timeout={configured_soft_timeout}")
                 debug(f"completion_reserve_sec={self._completion_reserve_sec}")
                 debug(f"effective_soft_timeout={soft_timeout}")
+                debug(f"resume_window={resume_window} max_resume_rounds={max_rounds}")
                 started_at = time.time()
                 host_missing_since: float | None = None
                 last_snapshot_time = started_at
                 host_turn_count = 0
+                resume_round = 0
+                window_started_at = started_at
+                current_window = soft_timeout
                 while True:
                     if result_file.exists():
                         debug(f"result_file exists={result_file}")
@@ -196,8 +206,20 @@ class SalonAgent(BaseAgent):
                             except Exception as exc:
                                 logger.warning("snapshot failed: %s", exc)
                                 debug(f"snapshot failed: {exc}")
-                    if time.time() - started_at > soft_timeout:
-                        debug("soft timeout reached; killing salon session")
+                    if time.time() - window_started_at > current_window:
+                        if resume_round < max_rounds:
+                            resume_round += 1
+                            debug(f"window timeout; attempting resume round {resume_round}/{max_rounds}")
+                            self._kill_host_pane()
+                            relaunched = self._relaunch_host(repo_root, env)
+                            debug(f"relaunch_success={relaunched}")
+                            if relaunched:
+                                host_missing_since = None
+                                window_started_at = time.time()
+                                current_window = resume_window
+                                debug(f"resume round {resume_round} started, window={resume_window}s")
+                                continue
+                        debug("final timeout reached; killing salon session")
                         self._kill_salon_session()
                         usage = self._try_parse_session_logs(logging_dir)
                         debug(f"timeout_recovered_usage={usage}")
@@ -488,3 +510,44 @@ class SalonAgent(BaseAgent):
             text=True,
             check=False,
         )
+
+    def _kill_host_pane(self) -> None:
+        """Kill only the host pane (pane 0), leaving guest panes alive."""
+        if not self._tmux_session_name:
+            return
+        host_target = f"{self._tmux_session_name}:0.0"
+        # Send Ctrl-C then kill the pane process
+        subprocess.run(
+            ["tmux", "send-keys", "-t", host_target, "C-c", ""],
+            capture_output=True, text=True, check=False,
+        )
+        time.sleep(1)
+        subprocess.run(
+            ["tmux", "send-keys", "-t", host_target, "exit", "Enter"],
+            capture_output=True, text=True, check=False,
+        )
+        time.sleep(2)
+
+    def _relaunch_host(self, repo_root: Path, env: dict[str, str]) -> bool:
+        """Relaunch the host CLI in the existing tmux session's first pane."""
+        if not self._tmux_session_name:
+            return False
+        host_target = f"{self._tmux_session_name}:0.0"
+        # Check the pane still exists
+        check = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", host_target, "#{pane_id}"],
+            capture_output=True, text=True, check=False,
+        )
+        if check.returncode != 0:
+            return False
+        # Relaunch node dist/main.js in the host pane
+        cmd = f"cd {repo_root} && node dist/main.js"
+        # Set env vars inline
+        env_prefix = " ".join(f"{k}={v}" for k, v in env.items()
+                              if k.startswith("SALON_") or k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"))
+        full_cmd = f"{env_prefix} {cmd}" if env_prefix else cmd
+        subprocess.run(
+            ["tmux", "send-keys", "-t", host_target, full_cmd, "Enter"],
+            capture_output=True, text=True, check=False,
+        )
+        return True

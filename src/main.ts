@@ -107,7 +107,12 @@ if (process.env.SALON_RESULT_FILE) {
 
 const extensionPath = join(SCRIPT_DIR, "src", "extension.ts");
 const piBin = join(SCRIPT_DIR, "node_modules", ".bin", "pi");
-const hostCommand = joinShellArgs([piBin, "--extension", extensionPath]);
+const hostModel = process.env.SALON_HOST_MODEL;
+const hostCommand = joinShellArgs([
+	piBin,
+	"--extension", extensionPath,
+	...(hostModel ? ["--model", hostModel] : []),
+]);
 launcher.launchHost(hostCommand);
 
 if (!AUTONOMOUS_MODE) {
