@@ -632,7 +632,12 @@ Use Docker to interact with the container:
 
 The environment variable SALON_CONTAINER_ID is already set for you.
 Do NOT use ssh or your native Read/Edit/Bash tools to access container files.
-Use docker exec $SALON_CONTAINER_ID bash -c '...' for all container inspection and mutation.`;
+Use docker exec $SALON_CONTAINER_ID bash -c '...' for all container inspection and mutation.
+
+IMPORTANT: Never cat or read large data files (sequences, CSVs, binaries, datasets)
+into your context without limiting output. Always use head, tail, or wc -l first to
+check size, then read only what you need. Large raw data in your context wastes tokens
+and can cause severe performance degradation.`;
 
 function createCodexGuestNonce(): string {
 	return `SALON_NONCE:${randomUUID().replace(/-/g, "").slice(0, 8)}`;
