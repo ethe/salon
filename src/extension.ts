@@ -2839,8 +2839,15 @@ Writing comprehensive test suites during review wastes time and risks timeout.
 
 ## Termination — call finish_task promptly
 
+When the executor reports done with self-verification passing, call finish_task
+immediately. Do not wait for the reviewer if the executor has already verified
+its own output. Reviewer verification is valuable but not worth risking a timeout
+— a self-verified solution that gets submitted beats a reviewed solution that
+never gets submitted.
+
 finish_task(status="solved"):
   Verification commands pass, or strong evidence the task requirements are met.
+  This includes the executor's own self-verification passing.
 
 finish_task(status="incomplete"):
   Partial progress was made. Use after: 2 fix-review cycles failed on the same issue, or the approach works partially but a specific sub-problem remains unsolved.
