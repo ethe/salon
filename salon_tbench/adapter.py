@@ -21,7 +21,6 @@ class SalonAgent(BaseAgent):
         self,
         soft_timeout_sec: int = 1200,
         completion_reserve_sec: int = 60,
-        max_resume_rounds: int = 3,
         resume_window_sec: int = 600,
         **kwargs: Any,
         ) -> None:
@@ -31,7 +30,6 @@ class SalonAgent(BaseAgent):
             self._result_file: Path | None = None
             self._soft_timeout_sec = soft_timeout_sec
             self._completion_reserve_sec = completion_reserve_sec
-            self._max_resume_rounds = max_resume_rounds
             self._resume_window_sec = resume_window_sec
             self._extra_kwargs = kwargs
 
@@ -144,11 +142,10 @@ class SalonAgent(BaseAgent):
                 configured_soft_timeout = int(os.environ.get("SALON_SOFT_TIMEOUT", str(self._soft_timeout_sec)))
                 soft_timeout = self._effective_soft_timeout()
                 resume_window = int(os.environ.get("SALON_RESUME_WINDOW", str(self._resume_window_sec)))
-                max_rounds = int(os.environ.get("SALON_MAX_RESUME_ROUNDS", str(self._max_resume_rounds)))
                 debug(f"configured_soft_timeout={configured_soft_timeout}")
                 debug(f"completion_reserve_sec={self._completion_reserve_sec}")
                 debug(f"effective_soft_timeout={soft_timeout}")
-                debug(f"resume_window={resume_window} max_resume_rounds={max_rounds}")
+                debug(f"resume_window={resume_window}")
                 started_at = time.time()
                 host_missing_since: float | None = None
                 last_snapshot_time = started_at
@@ -207,19 +204,19 @@ class SalonAgent(BaseAgent):
                                 logger.warning("snapshot failed: %s", exc)
                                 debug(f"snapshot failed: {exc}")
                     if time.time() - window_started_at > current_window:
-                        if resume_round < max_rounds:
-                            resume_round += 1
-                            debug(f"window timeout; attempting resume round {resume_round}/{max_rounds}")
-                            self._kill_host_pane()
-                            relaunched = self._relaunch_host(repo_root, env)
-                            debug(f"relaunch_success={relaunched}")
-                            if relaunched:
-                                host_missing_since = None
-                                window_started_at = time.time()
-                                current_window = resume_window
-                                debug(f"resume round {resume_round} started, window={resume_window}s")
-                                continue
-                        debug("final timeout reached; killing salon session")
+                        resume_round += 1
+                        debug(f"window timeout; attempting resume round {resume_round}")
+                        self._kill_host_pane()
+                        relaunched = self._relaunch_host(repo_root, env)
+                        debug(f"relaunch_success={relaunched}")
+                        if relaunched:
+                            host_missing_since = None
+                            window_started_at = time.time()
+                            current_window = resume_window
+                            debug(f"resume round {resume_round} started, window={resume_window}s")
+                            continue
+                        # Relaunch failed — fall through to final kill
+                        debug("relaunch failed; killing salon session")
                         self._kill_salon_session()
                         usage = self._try_parse_session_logs(logging_dir)
                         debug(f"timeout_recovered_usage={usage}")
