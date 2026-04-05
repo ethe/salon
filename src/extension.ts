@@ -2791,13 +2791,20 @@ Send the executor a plan brief via say_to_guest containing:
      write your output there — never to /tmp/ or any other temporary location.
      The test harness checks the task-specified path. Write a first draft early,
      then iterate. A partial solution that exists at the correct path is better
-     than a perfect solution that times out."
+     than a perfect solution that times out.
+     Before reporting done, run the benchmark test:
+     docker exec $SALON_CONTAINER_ID bash -c 'bash $TEST_DIR/run-tests.sh 2>&1 | tail -30'
+     Fix any failures the test reports. Do not report done until the test passes."
 
 The executor must:
   a. Run the capability preflight.
   b. Write a first-draft artifact to the EXACT task-specified path within its
      first 3-4 docker exec rounds.
-  c. Iterate: compile, test, fix.
+  c. Run the benchmark test if available:
+     docker exec $SALON_CONTAINER_ID bash -c 'bash $TEST_DIR/run-tests.sh 2>&1 | tail -30'
+     or: docker exec $SALON_CONTAINER_ID bash -c 'cd /app && python -m pytest $TEST_DIR/ -rA 2>&1 | tail -30'
+     Fix any failures before reporting done.
+  d. Iterate: compile, test, fix.
 
 ### Step 2 — Streaming review
 
