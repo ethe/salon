@@ -20,7 +20,7 @@ class SalonAgent(BaseAgent):
     def __init__(
         self,
         soft_timeout_sec: int = 1200,
-        completion_reserve_sec: int = 180,
+        completion_reserve_sec: int = 60,
         **kwargs: Any,
         ) -> None:
             self._tmux_session_name: str | None = None
