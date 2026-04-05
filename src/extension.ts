@@ -2792,22 +2792,14 @@ Send the executor a plan brief via say_to_guest containing:
      The test harness checks the task-specified path. Write a first draft early,
      then iterate. A partial solution that exists at the correct path is better
      than a perfect solution that times out.
-     Before reporting done, find and run the benchmark test:
-     docker exec $SALON_CONTAINER_ID bash -c 'echo TEST_DIR=$TEST_DIR'
-     docker exec $SALON_CONTAINER_ID bash -c 'bash $TEST_DIR/run-tests.sh 2>&1 | tail -30'
-     Use $TEST_DIR — do NOT hardcode /app/tests/. Fix any failures. Do not
-     report done until the test passes."
+     Write a first draft early, then iterate. A partial solution that exists
+     at the correct path is better than a perfect solution that times out."
 
 The executor must:
   a. Run the capability preflight.
   b. Write a first-draft artifact to the EXACT task-specified path within its
      first 3-4 docker exec rounds.
-  c. Run the benchmark test if available. First find the test directory:
-     docker exec $SALON_CONTAINER_ID bash -c 'echo $TEST_DIR'
-     Then run the tests using that path (do NOT hardcode /app/tests/):
-     docker exec $SALON_CONTAINER_ID bash -c 'bash $TEST_DIR/run-tests.sh 2>&1 | tail -30'
-     Fix any failures before reporting done.
-  d. Iterate: compile, test, fix.
+  c. Iterate: compile, test, fix.
 
 ### Step 2 — Streaming review
 
@@ -2844,17 +2836,12 @@ Review strategy: do minimal spot-check verification only — 1-2 inline docker e
 checks per issue. Do NOT write comprehensive test suites or do exhaustive analysis.
 Report each finding immediately — do not batch. If you find no blockers after
 your first 2-3 checks, report PASS.
-1. The expected artifact exists at the benchmark-specified path (check with ls /app/)
-2. If the task directory contains a test harness (/tests/, pytest.ini, run-tests.sh),
-   run it: docker exec $SALON_CONTAINER_ID bash -c 'cd /app && python -m pytest -q 2>&1 | tail -20'
-3. For tasks requiring "unchanged" output (e.g., filtering, transformation),
-   verify the unchanged-input invariant holds on a sample of clean inputs
-4. Do NOT only validate the specific cases you designed — validate what the benchmark validates
-5. For tasks involving extraction, inference, or learning:
-   - Do NOT validate only against the visible instance (e.g., visible forward.py, visible weights)
+1. The expected artifact exists at the task-specified path.
+2. If a test harness exists in the container, run it.
+3. Verify the output meets the task requirements, not just the cases you designed.
+4. For tasks involving extraction, inference, or learning:
    - Test with at least one alternative input (different seed, shape, or data)
-   - Verify output dimensions/schema match the task contract, not just the currently visible example
-   - A solution that only works on what you can see is NOT a solution
+   - A solution that only works on the visible example is NOT a solution.
 
 ## Termination — call finish_task promptly
 
