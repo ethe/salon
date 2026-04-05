@@ -2821,10 +2821,10 @@ cycles, then call finish_task with whatever state exists.
 
 ## Reviewer acceptance checklist
 Before approving, verify ALL acceptance criteria:
-Review strategy: do minimal spot-check verification only.
-Do NOT write large test files to verify the implementation.
-Instead: run 1-2 small inline tests via docker exec, or read the implementation and reason about correctness.
-Writing comprehensive test suites during review wastes time and risks timeout.
+Review strategy: do minimal spot-check verification only — 1-2 inline docker exec
+checks. Do NOT write comprehensive test suites or spend time on exhaustive analysis.
+Complete your review and report back within 10 minutes. If you need more time,
+report a partial review and flag what still needs checking.
 1. The expected artifact exists at the benchmark-specified path (check with ls /app/)
 2. If the task directory contains a test harness (/tests/, pytest.ini, run-tests.sh),
    run it: docker exec $SALON_CONTAINER_ID bash -c 'cd /app && python -m pytest -q 2>&1 | tail -20'
