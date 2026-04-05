@@ -96,10 +96,20 @@ extract_codex_last_user_input() {
 
 EVENT_TYPE=$(printf "%s" "$INPUT" | jq -r '.type // empty')
 if [[ -n "$EVENT_TYPE" ]]; then
-	# Codex CLI notify payload
-	if [[ "$EVENT_TYPE" != "agent-turn-complete" ]]; then exit 0; fi
+	# Codex CLI notify payload — accept both turn-complete and task-complete
+	case "$EVENT_TYPE" in
+		agent-turn-complete|task-complete|task_complete) ;;
+		*) exit 0 ;;
+	esac
 
-	LAST_MESSAGE=$(printf "%s" "$INPUT" | jq -r '.["last-assistant-message"] // empty')
+	# Field name varies: agent-turn-complete uses "last-assistant-message",
+	# task-complete uses "last-agent-message" or "last_agent_message"
+	LAST_MESSAGE=$(printf "%s" "$INPUT" | jq -r '
+		.["last-assistant-message"]
+		// .["last-agent-message"]
+		// .["last_agent_message"]
+		// .["last_assistant_message"]
+		// empty')
 	if [[ -z "$LAST_MESSAGE" ]]; then exit 0; fi
 
 	LAST_USER_INPUT=$(extract_codex_last_user_input)
