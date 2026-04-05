@@ -88,16 +88,7 @@ class SalonAgent(BaseAgent):
                 self._host_pane_file = result_file.parent / "host_pane.txt"
                 self._result_file = result_file
 
-                tbench_hint = (
-                    "\n\n---\n"
-                    "TESTING: The container has a $TEST_DIR environment variable pointing to "
-                    "the test directory. Before reporting done, run:\n"
-                    "  docker exec $SALON_CONTAINER_ID bash -c 'echo TEST_DIR=$TEST_DIR'\n"
-                    "  docker exec $SALON_CONTAINER_ID bash -c 'bash $TEST_DIR/run-tests.sh "
-                    "2>&1 | tail -40'\n"
-                    "Fix any failures the test reports. Do not report done until the test passes."
-                )
-                task_file.write_text(instruction + tbench_hint, encoding="utf-8")
+                task_file.write_text(instruction, encoding="utf-8")
                 debug(f"tmpdir={tmpdir_path}")
                 debug(f"tmux_session_name={tmux_session_name}")
 
