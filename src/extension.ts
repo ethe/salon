@@ -2801,18 +2801,27 @@ Tell the executor in its brief:
    then iterate. A partial solution that exists at the correct path is better
    than a perfect solution that times out."
 
-### Step 2 — Reviewer verifies
+### Step 2 — Reviewer verifies (streaming, not batched)
 
 The reviewer runs in parallel with the executor. It should begin by reading
 the task requirements and inspecting the container environment independently.
-When the executor reports done, forward the executor's summary to the reviewer
-and ask it to verify inside the container. The reviewer runs spot-checks only
-(see Reviewer acceptance checklist below).
+When the executor reports done, forward the executor's summary to the reviewer.
 
-### Step 3 — Fix cycle (max 2 rounds)
+Tell the reviewer in its brief:
+  "Report each blocker AS SOON as you find it — do not wait until you have
+   reviewed everything. Send your first finding immediately, then continue
+   reviewing. The host will forward your findings to the executor for fixing
+   while you keep looking."
 
-If the reviewer finds defects, forward them to the executor. Max 2 fix-review
-cycles, then call finish_task with whatever state exists.
+### Step 3 — Streaming fix cycle (max 2 rounds per issue)
+
+When the reviewer reports a blocker, IMMEDIATELY forward it to the executor
+with say_to_guest. Do NOT wait for the reviewer to finish its full review.
+Then tell the reviewer to continue reviewing. This way the executor starts
+fixing while the reviewer keeps finding issues — review and fix run in parallel.
+
+Max 2 fix attempts per blocker. If the same issue persists after 2 rounds,
+call finish_task with whatever state exists.
 
 ### Fallbacks
 - If the executor fails preflight: reassign reviewer as executor.
@@ -2820,11 +2829,10 @@ cycles, then call finish_task with whatever state exists.
 - If the executor is stuck after 2 rounds on the same error: finish_task(incomplete).
 
 ## Reviewer acceptance checklist
-Before approving, verify ALL acceptance criteria:
 Review strategy: do minimal spot-check verification only — 1-2 inline docker exec
-checks. Do NOT write comprehensive test suites or spend time on exhaustive analysis.
-Complete your review and report back within 10 minutes. If you need more time,
-report a partial review and flag what still needs checking.
+checks per issue. Do NOT write comprehensive test suites or do exhaustive analysis.
+Report each finding immediately — do not batch. If you find no blockers after
+your first 2-3 checks, report PASS.
 1. The expected artifact exists at the benchmark-specified path (check with ls /app/)
 2. If the task directory contains a test harness (/tests/, pytest.ini, run-tests.sh),
    run it: docker exec $SALON_CONTAINER_ID bash -c 'cd /app && python -m pytest -q 2>&1 | tail -20'
