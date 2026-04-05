@@ -235,6 +235,10 @@ class SalonAgent(BaseAgent):
             if logging_dir:
                 (logging_dir / "adapter_error.log").write_text(traceback.format_exc(), encoding="utf-8")
             raise
+        finally:
+            # Always clean up the tmux session, even if the harness kills us mid-flight.
+            # This prevents stale salon-tbench-* sessions from accumulating.
+            self._kill_salon_session()
 
     def _parse_result(self, result_file: Path) -> AgentResult:
         data = json.loads(result_file.read_text(encoding="utf-8"))
