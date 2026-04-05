@@ -2765,6 +2765,10 @@ If BOTH guests fail: call finish_task(blocked) immediately.
 
 ## Reviewer acceptance checklist
 Before approving, verify ALL acceptance criteria:
+Review strategy: do minimal spot-check verification only.
+Do NOT write large test files to verify the implementation.
+Instead: run 1-2 small inline tests via tb exec, or read the implementation and reason about correctness.
+Writing comprehensive test suites during review wastes time and risks timeout.
 1. The expected artifact exists at the benchmark-specified path (check with ls /app/)
 2. If the task directory contains a test harness (/tests/, pytest.ini, run-tests.sh),
    run it: tb exec -- 'cd /app && python -m pytest -q 2>&1 | tail -20'

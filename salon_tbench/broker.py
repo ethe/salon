@@ -16,6 +16,7 @@ from terminal_bench.terminal.tmux_session import TmuxSession
 
 _DEFAULT_EXEC_TIMEOUT_SEC = 120
 _DEFAULT_IO_TIMEOUT_SEC = 30
+_DEFAULT_WRITE_TIMEOUT_SEC = 300
 _MAX_EXEC_OUTPUT_CHARS = 15000
 _POLL_INTERVAL_SEC = 0.1
 _START_MARKER_PREFIX = "__SALON_TB_START__"
@@ -171,7 +172,7 @@ class TerminalBroker:
 
 		result = self._execute_cmd(
 			args=command,
-			timeout=_DEFAULT_IO_TIMEOUT_SEC,
+			timeout=_DEFAULT_WRITE_TIMEOUT_SEC,
 			max_output_chars=None,
 		)
 		if int(result.get("exit_code", 1)) != 0:
