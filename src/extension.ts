@@ -970,6 +970,8 @@ function inviteGuest(
 	const instructionsFile = join(guestDir, `${name}.instructions`);
 	writeFileSync(instructionsFile, instructions);
 
+	const guestEffort = process.env.SALON_GUEST_EFFORT || "";
+
 	let cmd: string;
 	if (type === "codex") {
 		cmd = joinShellArgs([
@@ -984,6 +986,7 @@ function inviteGuest(
 			"--session-id",
 			sessionId!,
 			...(dangerouslySkipPermissions ? ["--dangerously-skip-permissions"] : []),
+			...(guestEffort ? ["--effort", guestEffort] : []),
 			"--append-system-prompt-file",
 			instructionsFile,
 		]);
@@ -1918,6 +1921,8 @@ export default function salonExtension(pi: ExtensionAPI) {
 		}
 		const dangerouslySkipPermissions = dismissed.dangerouslySkipPermissions === true;
 
+		const guestEffort = process.env.SALON_GUEST_EFFORT || "";
+
 		let cmd: string;
 		if (dismissed.type === "codex") {
 			cmd = joinShellArgs([
@@ -1934,6 +1939,7 @@ export default function salonExtension(pi: ExtensionAPI) {
 				"--resume",
 				dismissed.sessionId!,
 				...(dangerouslySkipPermissions ? ["--dangerously-skip-permissions"] : []),
+				...(guestEffort ? ["--effort", guestEffort] : []),
 				"--append-system-prompt-file",
 				instructionsFile,
 			]);
@@ -2798,7 +2804,10 @@ Send the executor a plan brief via say_to_guest containing:
      then iterate. A partial solution that exists at the correct path is better
      than a perfect solution that times out.
      Write a first draft early, then iterate. A partial solution that exists
-     at the correct path is better than a perfect solution that times out."
+     at the correct path is better than a perfect solution that times out.
+     Clean up after yourself: remove any build artifacts (compiled binaries,
+     .o files, etc.) from the output directory. The test harness checks that
+     ONLY the requested file(s) exist at the output path."
 
 The executor must:
   a. Run the capability preflight.
@@ -2850,15 +2859,17 @@ your first 2-3 checks, report PASS.
 
 ## Termination — call finish_task promptly
 
-When the executor reports done with self-verification passing, call finish_task
-immediately. Do not wait for the reviewer if the executor has already verified
-its own output. Reviewer verification is valuable but not worth risking a timeout
-— a self-verified solution that gets submitted beats a reviewed solution that
-never gets submitted.
+When the executor reports done, ALWAYS forward to the reviewer for verification
+before calling finish_task. The executor does basic self-checks (compiles, runs,
+produces output); the reviewer does generalization checks (alternative inputs,
+edge cases, the acceptance checklist above). Only call finish_task after the
+reviewer reports PASS or after the fix cycle completes.
+
+Exception: if the harness sends a time warning (e.g. "[HARNESS] WARNING: Only Xs
+remaining"), call finish_task immediately with whatever state exists.
 
 finish_task(status="solved"):
-  Verification commands pass, or strong evidence the task requirements are met.
-  This includes the executor's own self-verification passing.
+  Reviewer reports PASS, or strong evidence the task requirements are met.
 
 finish_task(status="incomplete"):
   Partial progress was made. Use after: 2 fix-review cycles failed on the same issue, or the approach works partially but a specific sub-problem remains unsolved.
@@ -2872,7 +2883,6 @@ finish_task(status="blocked"):
 - Do not run more than 2 fix-review cycles on the same issue. After 2 rounds, call finish_task with the current state.
 - Do not invite more than 2 guests total.
 - If a guest produces the same category of error 3 consecutive times, switch to the other guest or call finish_task.
-- Aim to reach finish_task within roughly 8 host turns. Beyond 10 turns, you are likely looping — call finish_task.
 
 `
 			: "";
